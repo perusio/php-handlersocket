@@ -1,0 +1,7 @@
+Description
+-----------
+This extension provide API for communicating with HandlerSocket plugin for MySQL.
+
+Resources
+---------
+ * [HandlerSocket] (http://github.com/ahiguti/HandlerSocket-Plugin-for-MySQL)

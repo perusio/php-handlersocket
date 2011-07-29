@@ -1,0 +1,52 @@
+handlersocket extension changelog
+
+Version 0.2.0
+-------------
+	* Updated implemented IN.
+	* Added examples/regtest/tests/021-023.phpt : test scripts.
+	* hsclient 2011-04-05 later.
+
+Version 0.1.0
+-------------
+	* Updated implemented filters.
+	* Updated executeInsert auto_increment.
+	* Added examples/regtest/tests/010-020.phpt : test scripts.
+	* hsclient 2010-12-24 later.
+
+Version 0.0.8
+-------------
+	* Fixed port parameter.
+
+Version 0.0.7
+-------------
+	* Added config.m4 : handlersocket include [with-handlersocket-includedir].
+
+Version 0.0.6
+-------------
+	* Fixed config.m4.
+
+Version 0.0.5
+-------------
+	* Fixed executeUpdate, executeDelete.
+	* Fixed handlersocket_set_error.
+	* Fixed config.m4.
+
+Version 0.0.4
+-------------
+	* Updated executeSingle arguments.
+	* Fixed executeDelete.
+	* Version PHP 5 or newer.
+	* Added examples tests scripts.
+
+Version 0.0.3
+-------------
+	* Fixed bug undefine fields.
+
+Version 0.0.2
+-------------
+	* Fixed bug thread safety.
+	* Added support PHP 5.2.0+.
+
+Version 0.0.1
+-------------
+	* Initial release.

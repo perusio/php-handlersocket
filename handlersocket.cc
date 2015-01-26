@@ -168,9 +168,13 @@ static zend_object_value php_handlersocket_new(zend_class_entry *ce TSRMLS_DC)
     hs->object.ce = ce;
 #endif
 
+#if PHP_VERSION_ID < 50399
     zend_hash_copy(
         hs->object.properties, &ce->default_properties,
         (copy_ctor_func_t)zval_add_ref, (void *)&tmp, sizeof(zval *));
+#else
+    object_properties_init((zend_object*) &(hs->object), ce);
+#endif
 
     retval.handle = zend_objects_store_put(
         hs, (zend_objects_store_dtor_t)zend_objects_destroy_object,

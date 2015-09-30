@@ -21,7 +21,7 @@ from the MySQL plugin author.
 
  2. A blog
     [post](http://yoshinorimatsunobu.blogspot.com/2010/10/using-mysql-as-nosql-story-for.html)
-    from the database infrastructure architecht at
+    from the database infrastructure architect at
     [DeNA](http://www.dena.jp/en/index.html), the largest japanese
     social gaming platform.
     

@@ -14,7 +14,7 @@ if test -z "$tmp_version"; then
   fi
   php_version=`$PHP_CONFIG --version 2> /dev/null | head -n 1 | sed -e 's#\([0-9]\.[0-9]*\.[0-9]*\)\(.*\)#\1#'`
 else
-  php_version=`echo "$VERSION" | sed -e 's#\([0-9]\.[0-9]*\.[0-9]*\)\(.*\)#\1#'`
+  php_version=`echo "$PHP_VERSION" | sed -e 's#\([0-9]\.[0-9]*\.[0-9]*\)\(.*\)#\1#'`
 fi
 
 if test -z "$php_version"; then

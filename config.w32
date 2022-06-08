@@ -1,13 +1,8 @@
 // $Id$
 // vim:ft=javascript
 
-// If your extension references something external, use ARG_WITH
-// ARG_WITH("handlersocket", "for handlersocket support", "no");
-
-// Otherwise, use ARG_ENABLE
-// ARG_ENABLE("handlersocket", "enable handlersocket support", "no");
+ARG_ENABLE("handlersocket", "for handlersocket support", "yes");
 
 if (PHP_HANDLERSOCKET != "no") {
-	EXTENSION("handlersocket", "handlersocket.cc");
+	EXTENSION("handlersocket", "handlersocket.c", PHP_HANDLERSOCKET_SHARED, "");
 }
-

@@ -1,5 +1,17 @@
 handlersocket extension changelog
 
+Version 0.3.1
+-------------
+	* Added support PHP 5.4.x.
+
+Version 0.3.0
+-------------
+	* Added auth method.
+	* Added HandlerSocketIndex class.
+	* Added config.m4 : [disble-handlersocket-libhsclient].
+	* Added handlersocket.c : native implemented. (used PHP streams)
+	* Added compatible with Windows. (native implemented version)
+
 Version 0.2.0
 -------------
 	* Updated implemented IN.

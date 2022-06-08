@@ -1,21 +1,31 @@
 
-extern "C" {
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
+#ifndef PHP_WIN32
+#ifdef HAVE_DEBUG
+#define HS_DEBUG 1
+#endif
+#endif
+
 #include "php.h"
 #include "php_ini.h"
+#include "php_network.h"
+#include "php_streams.h"
 #include "zend_exceptions.h"
+#include "ext/standard/file.h"
 #include "ext/standard/info.h"
+#include "ext/standard/php_smart_str.h"
 #include "ext/standard/php_string.h"
 
+#ifndef PHP_WIN32
+#define php_select(m, r, w, e, t) select(m, r, w, e, t)
+#else
+#include "win32/select.h"
+#endif
+
 #include "php_handlersocket.h"
-}
-
-#include <sstream>
-#include <hstcpcli.hpp> /* handlersocket */
-
 
 #define HS_PRIMARY "PRIMARY"
 
@@ -41,6 +51,15 @@ extern "C" {
 #define HS_MODIFY_DECREMENT_PREV "-?"
 #define HS_MODIFY_REMOVE_PREV    "D?"
 
+#define HS_CODE_NULL          0x00
+#define HS_CODE_DELIMITER     0x09
+#define HS_CODE_EOL           0x0a
+#define HS_CODE_ESCAPE        0x10
+#define HS_CODE_ESCAPE_PREFIX 0x01
+#define HS_CODE_ESCAPE_ADD    0x40
+
+#define HS_SOCKET_BLOCK_SIZE 4096
+
 static zend_class_entry *hs_ce = NULL;
 static zend_class_entry *hs_index_ce = NULL;
 static zend_class_entry *hs_exception_ce = NULL;
@@ -48,8 +67,11 @@ static zend_class_entry *hs_exception_ce = NULL;
 typedef struct
 {
     zend_object object;
+    php_stream *stream;
+    long timeout;
+    zval *server;
+    zval *auth;
     zval *error;
-    dena::hstcpcli_i *cli;
 } php_hs_t;
 
 typedef struct
@@ -107,6 +129,11 @@ typedef struct
 
 #define HS_ERROR_RESET(error) \
   if (error) { zval_ptr_dtor(&error); } MAKE_STD_ZVAL(error); ZVAL_NULL(error);
+
+#define HS_REQUEST_LONG(buf, num) smart_str_append_long(buf, num);
+#define HS_REQUEST_NULL(buf) smart_str_appendc(buf, HS_CODE_NULL);
+#define HS_REQUEST_DELIM(buf) smart_str_appendc(buf, HS_CODE_DELIMITER);
+#define HS_REQUEST_NEXT(buf) smart_str_appendc(buf, HS_CODE_EOL);
 
 
 static zend_object_value hs_new(zend_class_entry *ce TSRMLS_DC);
@@ -430,7 +457,6 @@ PHP_MINFO_FUNCTION(handlersocket)
     php_info_print_table_row(2, "MySQL HandlerSocket support", "enabled");
     php_info_print_table_row(
         2, "extension Version", HANDLERSOCKET_EXTENSION_VERSION);
-    php_info_print_table_row(2, "hsclient Library Support", "enabled");
     php_info_print_table_end();
 }
 
@@ -455,229 +481,6 @@ zend_module_entry handlersocket_module_entry = {
 ZEND_GET_MODULE(handlersocket)
 #endif
 
-
-inline static std::string hs_long_to_string(long n)
-{
-    std::ostringstream s;
-    s << std::dec << n;
-    return s.str();
-}
-
-inline static void hs_array_to_vector(
-    zval *value, std::vector<dena::string_ref>& vec TSRMLS_DC)
-{
-    size_t n;
-    zval **data;
-    HashPosition pos;
-    HashTable *ht;
-
-    ht = HASH_OF(value);
-    n = zend_hash_num_elements(ht);
-
-    if (n == 0)
-    {
-        vec.push_back(dena::string_ref());
-        return;
-    }
-
-    vec.reserve(n);
-
-    zend_hash_internal_pointer_reset_ex(ht, &pos);
-    while (zend_hash_get_current_data_ex(ht, (void **)&data, &pos) == SUCCESS)
-    {
-        if (Z_TYPE_PP(data) == IS_STRING)
-        {
-            vec.push_back(
-                dena::string_ref(Z_STRVAL_PP(data), Z_STRLEN_PP(data)));
-        }
-        else if (Z_TYPE_PP(data) == IS_LONG ||
-                 Z_TYPE_PP(data) == IS_DOUBLE ||
-                 Z_TYPE_PP(data) == IS_BOOL)
-        {
-            convert_to_string(*data);
-            vec.push_back(
-                dena::string_ref(Z_STRVAL_PP(data), Z_STRLEN_PP(data)));
-        }
-        else
-        {
-            vec.push_back(dena::string_ref());
-        }
-        zend_hash_move_forward_ex(ht, &pos);
-    }
-}
-
-inline static void hs_array_to_conf(HashTable *ht, dena::config& conf TSRMLS_DC)
-{
-    zval **tmp;
-    HashPosition pos;
-    char *key;
-    uint key_len;
-    ulong key_index;
-
-    zend_hash_internal_pointer_reset_ex(ht, &pos);
-    while (zend_hash_get_current_data_ex(ht, (void **)&tmp, &pos) == SUCCESS)
-    {
-        if (zend_hash_get_current_key_ex(
-                ht, &key, &key_len, &key_index, 0, &pos)  == HASH_KEY_IS_STRING)
-        {
-            convert_to_string(*tmp);
-            if (strcmp(key, "host") == 0)
-            {
-                conf["host"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "port") == 0)
-            {
-                conf["port"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "timeout") == 0)
-            {
-                conf["timeout"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "listen_backlog") == 0)
-            {
-                conf["listen_backlog"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "sndbuf") == 0)
-            {
-                conf["sndbuf"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "rcvbuf") == 0)
-            {
-                conf["rcvbuf"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "use_epoll") == 0)
-            {
-                conf["use_epoll"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "num_threads") == 0)
-            {
-                conf["num_threads"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "readsize") == 0)
-            {
-                conf["readsize"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "accept_balance") == 0)
-            {
-                conf["accept_balance"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "wrlock_timeout") == 0)
-            {
-                conf["wrlock_timeout"] = std::string(Z_STRVAL_PP(tmp));
-            }
-            else if (strcmp(key, "for_write") == 0)
-            {
-                conf["for_write"] = std::string(Z_STRVAL_PP(tmp));
-            }
-        }
-        zend_hash_move_forward_ex(ht, &pos);
-    }
-}
-
-static void hs_array_to_string(std::string& str, HashTable *ht TSRMLS_DC)
-{
-    zval **tmp;
-    HashPosition pos;
-
-    if (zend_hash_num_elements(ht) >= 0)
-    {
-        zend_hash_internal_pointer_reset_ex(ht, &pos);
-        while (zend_hash_get_current_data_ex(
-                   ht, (void **)&tmp, &pos) == SUCCESS)
-        {
-            switch ((*tmp)->type)
-            {
-                case IS_STRING:
-                    str.append(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-                    break;
-                default:
-                    convert_to_string(*tmp);
-                    str.append(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-                    break;
-            }
-
-            str.append(",", 1);
-
-            zend_hash_move_forward_ex(ht, &pos);
-        }
-
-        str.erase(str.size() - 1, 1);
-    }
-}
-
-static void hs_array_to_vector_filter(
-    std::vector<dena::hstcpcli_filter>& vec, HashTable *ht TSRMLS_DC)
-{
-    zval **tmp;
-    dena::hstcpcli_filter fe;
-
-    if (zend_hash_index_find(ht, 0, (void **)&tmp) != SUCCESS)
-    {
-        return;
-    }
-
-    if (Z_TYPE_PP(tmp) == IS_ARRAY)
-    {
-        long n, i;
-
-        hs_array_to_vector_filter(vec, HASH_OF(*tmp) TSRMLS_CC);
-
-        n = zend_hash_num_elements(ht);
-        for (i = n - 1; i >= 1; i--)
-        {
-            if (zend_hash_index_find(ht, i, (void **)&tmp) != SUCCESS ||
-                Z_TYPE_PP(tmp) != IS_ARRAY)
-            {
-                continue;
-            }
-
-            hs_array_to_vector_filter(vec, HASH_OF(*tmp) TSRMLS_CC);
-        }
-    }
-    else if (zend_hash_num_elements(ht) < 4)
-    {
-        return;
-    }
-    else
-    {
-        convert_to_string(*tmp);
-        fe.filter_type = dena::string_ref(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-
-        if (zend_hash_index_find(ht, 1, (void **)&tmp) == SUCCESS)
-        {
-            convert_to_string(*tmp);
-            fe.op = dena::string_ref(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-        }
-
-        if (zend_hash_index_find(ht, 2, (void **)&tmp) == SUCCESS)
-        {
-            convert_to_long(*tmp);
-            fe.ff_offset = Z_LVAL_PP(tmp);
-        }
-
-        if (zend_hash_index_find(ht, 3, (void **)&tmp) == SUCCESS)
-        {
-            if (Z_TYPE_PP(tmp) == IS_STRING)
-            {
-                fe.val = dena::string_ref(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-            }
-            else if (Z_TYPE_PP(tmp) == IS_LONG ||
-                     Z_TYPE_PP(tmp) == IS_DOUBLE ||
-                     Z_TYPE_PP(tmp) == IS_BOOL)
-            {
-                convert_to_string(*tmp);
-                fe.val = dena::string_ref(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
-            }
-            else
-            {
-                fe.val = dena::string_ref();
-            }
-        }
-
-        vec.push_back(fe);
-    }
-}
-
 static zval* hs_zval_search_key(zval *value, zval *array TSRMLS_DC)
 {
     zval *return_value, **entry, res;
@@ -689,12 +492,6 @@ static zval* hs_zval_search_key(zval *value, zval *array TSRMLS_DC)
     int (*is_equal_func)(zval *, zval *, zval * TSRMLS_DC) = is_equal_function;
 
     MAKE_STD_ZVAL(return_value);
-
-    if (array == NULL || Z_TYPE_P(array) != IS_ARRAY)
-    {
-        ZVAL_NULL(return_value);
-        return return_value;
-    }
 
     ht = HASH_OF(array);
     zend_hash_internal_pointer_reset_ex(ht, &pos);
@@ -725,6 +522,50 @@ static zval* hs_zval_search_key(zval *value, zval *array TSRMLS_DC)
     ZVAL_NULL(return_value);
 
     return return_value;
+}
+
+static int hs_zval_to_operate_criteria(
+    zval *query, zval *operate, zval **criteria, char *defaults TSRMLS_DC)
+{
+    if (query == NULL)
+    {
+        return -1;
+    }
+
+    if (Z_TYPE_P(query) == IS_ARRAY)
+    {
+        char *key;
+        uint key_len;
+        ulong index;
+        HashTable *ht;
+        zval **tmp;
+
+        ht = HASH_OF(query);
+
+        if (zend_hash_get_current_data_ex(ht, (void **)&tmp, NULL) != SUCCESS)
+        {
+            return -1;
+        }
+
+        if (zend_hash_get_current_key_ex(
+                ht, &key, &key_len, &index, 0, NULL) == HASH_KEY_IS_STRING)
+        {
+            ZVAL_STRINGL(operate, key, key_len - 1, 1);
+            *criteria = *tmp;
+        }
+        else
+        {
+            ZVAL_STRINGL(operate, defaults, strlen(defaults), 1);
+            *criteria = query;
+        }
+    }
+    else
+    {
+        ZVAL_STRINGL(operate, defaults, strlen(defaults), 1);
+        *criteria = query;
+    }
+
+    return 0;
 }
 
 static void hs_zval_to_filter(
@@ -829,9 +670,155 @@ static void hs_zval_to_filter(
     zval_ptr_dtor(&index);
 }
 
+static void hs_request_string(smart_str *buf, char *str, long str_len)
+{
+    long i;
+
+    if (str_len <= 0)
+    {
+        return;
+    }
+    else
+    {
+        for (i = 0; i < str_len; i++)
+        {
+            if ((unsigned char)str[i] > HS_CODE_ESCAPE)
+            {
+                smart_str_appendc(buf, str[i]);
+            }
+            else
+            {
+                smart_str_appendc(buf, HS_CODE_ESCAPE_PREFIX);
+                smart_str_appendc(
+                    buf, (unsigned char)str[i] + HS_CODE_ESCAPE_ADD);
+            }
+        }
+    }
+}
+
+static void hs_request_zval_scalar(smart_str *buf, zval *val, int delim)
+{
+    switch (Z_TYPE_P(val))
+    {
+        case IS_LONG:
+            HS_REQUEST_LONG(buf, Z_LVAL_P(val));
+            break;
+        case IS_STRING:
+            hs_request_string(buf, Z_STRVAL_P(val), Z_STRLEN_P(val));
+            break;
+        case IS_DOUBLE:
+            convert_to_string(val);
+            hs_request_string(buf, Z_STRVAL_P(val), Z_STRLEN_P(val));
+            break;
+        case IS_BOOL:
+            convert_to_long(val);
+            HS_REQUEST_LONG(buf, Z_LVAL_P(val));
+            break;
+        case IS_NULL:
+            HS_REQUEST_NULL(buf);
+            break;
+        default:
+            //IS_ARRAY
+            //IS_OBJECT
+            //IS_RESOURCE
+            HS_REQUEST_LONG(buf, 0);
+            break;
+    }
+
+    if (delim > 0)
+    {
+        HS_REQUEST_DELIM(buf);
+    }
+}
+
+static void hs_request_array(
+    smart_str *buf, HashTable *ht, int num, int i TSRMLS_DC)
+{
+    long n;
+    HashPosition pos;
+    zval **data;
+
+    n = zend_hash_num_elements(ht);
+    if (i > 0 && i < n)
+    {
+        n = i;
+    }
+
+    if (n == 0)
+    {
+        if (num == 1)
+        {
+            HS_REQUEST_LONG(buf, 1);
+            HS_REQUEST_DELIM(buf);
+        }
+        HS_REQUEST_NULL(buf);
+        return;
+    }
+
+    if (num == 1)
+    {
+        HS_REQUEST_LONG(buf, n);
+        HS_REQUEST_DELIM(buf);
+    }
+
+    zend_hash_internal_pointer_reset_ex(ht, &pos);
+    while (zend_hash_get_current_data_ex(ht, (void **)&data, &pos) == SUCCESS)
+    {
+        if (n <= 0)
+        {
+            break;
+        }
+        n--;
+
+        hs_request_zval_scalar(buf, *data, n);
+
+        zend_hash_move_forward_ex(ht, &pos);
+    }
+}
+
+static void hs_request_filter(smart_str *request, HashTable *ht TSRMLS_DC)
+{
+    zval **tmp;
+    HashPosition pos;
+    long n, i = 0;
+
+    n = zend_hash_num_elements(ht);
+    if (n >= 0)
+    {
+        HS_REQUEST_DELIM(request);
+
+        zend_hash_internal_pointer_reset_ex(ht, &pos);
+        while (zend_hash_get_current_data_ex(ht, (void **)&tmp, &pos) == SUCCESS)
+        {
+            switch ((*tmp)->type)
+            {
+                case IS_STRING:
+                    hs_request_string(
+                        request, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
+                    break;
+                case IS_LONG:
+                    HS_REQUEST_LONG(request, Z_LVAL_PP(tmp));
+                    break;
+                default:
+                    convert_to_string(*tmp);
+                    hs_request_string(
+                        request, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
+                    break;
+            }
+
+            if (++i != n)
+            {
+                hs_request_string(request, ",", strlen(","));
+            }
+
+            zend_hash_move_forward_ex(ht, &pos);
+        }
+    }
+}
+
 static void hs_array_to_in_filter(
-    HashTable *ht, zval *filter,
-    zval **filters, long *in_key, zval **in_values TSRMLS_DC)
+    HashTable *ht, zval *filter, zval **filters,
+    long *in_key, zval **in_values TSRMLS_DC)
 {
     HashPosition pos;
     zval **val;
@@ -890,6 +877,7 @@ static void hs_array_to_in_filter(
                                 *in_key = Z_LVAL_P(key);
                                 zval_ptr_dtor(&key);
                                 break;
+
                             }
                         }
                         *in_values = *tmp;
@@ -924,217 +912,1030 @@ static void hs_array_to_in_filter(
     }
 }
 
-static int hs_zval_to_operate_criteria(
-    zval *query, zval *operate, zval **criteria, char *defaults TSRMLS_DC)
+static void hs_request_find(
+    smart_str *buf, long id,
+    zval * operate, zval *criteria, long limit, long offset,
+    zval *filters, long in_key, zval *in_values TSRMLS_DC)
 {
-    if (query == NULL)
+    HS_REQUEST_LONG(buf, id);
+    HS_REQUEST_DELIM(buf);
+
+    convert_to_string(operate);
+    hs_request_string(buf, Z_STRVAL_P(operate), Z_STRLEN_P(operate));
+    HS_REQUEST_DELIM(buf);
+
+    if (Z_TYPE_P(criteria) == IS_ARRAY)
+    {
+        hs_request_array(buf, HASH_OF(criteria), 1, -1 TSRMLS_CC);
+    }
+    else
+    {
+        HS_REQUEST_LONG(buf, 1);
+        HS_REQUEST_DELIM(buf);
+
+        hs_request_zval_scalar(buf, criteria, 0);
+    }
+
+    HS_REQUEST_DELIM(buf);
+    HS_REQUEST_LONG(buf, limit);
+
+    HS_REQUEST_DELIM(buf);
+    HS_REQUEST_LONG(buf, offset);
+
+    if (in_key >= 0 && in_values != NULL)
+    {
+        HS_REQUEST_DELIM(buf);
+
+        hs_request_string(buf, HS_PROTOCOL_IN, 1);
+        HS_REQUEST_DELIM(buf);
+
+        HS_REQUEST_LONG(buf, in_key);
+        HS_REQUEST_DELIM(buf);
+
+        if (Z_TYPE_P(in_values) == IS_ARRAY)
+        {
+            hs_request_array(buf, HASH_OF(in_values), 1, -1 TSRMLS_CC);
+        }
+        else
+        {
+            hs_request_zval_scalar(buf, in_values, 0);
+        }
+    }
+
+    if (filters != NULL && Z_TYPE_P(filters) == IS_ARRAY)
+    {
+        HashTable *ht;
+        HashPosition pos;
+        zval **tmp;
+
+        ht = HASH_OF(filters);
+
+        zend_hash_internal_pointer_reset_ex(ht, &pos);
+        while (zend_hash_get_current_data_ex(ht, (void **)&tmp, &pos) == SUCCESS)
+        {
+            if (Z_TYPE_PP(tmp) != IS_ARRAY ||
+                zend_hash_num_elements(HASH_OF(*tmp)) < 4)
+            {
+                zend_hash_move_forward_ex(ht, &pos);
+                continue;
+            }
+
+            HS_REQUEST_DELIM(buf);
+
+            hs_request_array(buf, HASH_OF(*tmp), -1, 4 TSRMLS_CC);
+
+            zend_hash_move_forward_ex(ht, &pos);
+        }
+    }
+}
+
+static void hs_request_find_execute(
+    smart_str *buf, long id,
+    zval * operate, zval *criteria,
+    long limit, long offset,
+    zval *filter, long in_key, zval *in_values TSRMLS_DC)
+{
+    HS_REQUEST_LONG(buf, id);
+    HS_REQUEST_DELIM(buf);
+
+    convert_to_string(operate);
+    hs_request_string(buf, Z_STRVAL_P(operate), Z_STRLEN_P(operate));
+    HS_REQUEST_DELIM(buf);
+
+    if (Z_TYPE_P(criteria) == IS_ARRAY)
+    {
+        hs_request_array(buf, HASH_OF(criteria), 1, -1 TSRMLS_CC);
+    }
+    else
+    {
+        HS_REQUEST_LONG(buf, 1);
+        HS_REQUEST_DELIM(buf);
+
+        hs_request_zval_scalar(buf, criteria, 0);
+    }
+
+    HS_REQUEST_DELIM(buf);
+    HS_REQUEST_LONG(buf, limit);
+
+    HS_REQUEST_DELIM(buf);
+    HS_REQUEST_LONG(buf, offset);
+
+    /* in */
+    if (in_key >= 0 && in_values != NULL)
+    {
+        HS_REQUEST_DELIM(buf);
+        hs_request_string(buf, HS_PROTOCOL_IN, 1);
+
+        HS_REQUEST_DELIM(buf);
+        HS_REQUEST_LONG(buf, in_key);
+
+        if (Z_TYPE_P(in_values) == IS_ARRAY)
+        {
+            HashTable *ht;
+            HashPosition pos;
+            zval **val;
+
+            ht = HASH_OF(in_values);
+
+            HS_REQUEST_DELIM(buf);
+            HS_REQUEST_LONG(buf, zend_hash_num_elements(ht));
+
+            zend_hash_internal_pointer_reset_ex(ht, &pos);
+            while (zend_hash_get_current_data_ex(
+                       ht, (void **)&val, &pos) == SUCCESS)
+            {
+                if (Z_TYPE_PP(val) == IS_ARRAY)
+                {
+                    HS_REQUEST_DELIM(buf);
+                    hs_request_array(buf, HASH_OF(*val), -1, -1 TSRMLS_CC);
+                }
+                else
+                {
+                    HS_REQUEST_DELIM(buf);
+                    hs_request_zval_scalar(buf, *val, 0);
+                }
+
+                zend_hash_move_forward_ex(ht, &pos);
+            }
+        }
+        else
+        {
+            HS_REQUEST_DELIM(buf);
+            HS_REQUEST_LONG(buf, 1);
+
+            HS_REQUEST_DELIM(buf);
+            hs_request_zval_scalar(buf, in_values, 0);
+        }
+    }
+
+    /* filter */
+    if (filter != NULL && Z_TYPE_P(filter) == IS_ARRAY)
+    {
+        HashTable *ht;
+        HashPosition pos;
+        zval **val, **tmp;
+
+        ht = HASH_OF(filter);
+
+        zend_hash_internal_pointer_reset_ex(ht, &pos);
+        while(zend_hash_get_current_data_ex(ht, (void **)&val, &pos) == SUCCESS)
+        {
+            if (Z_TYPE_PP(val) != IS_ARRAY ||
+                zend_hash_num_elements(HASH_OF(*val)) < 4)
+            {
+                zend_hash_move_forward_ex(ht, &pos);
+                continue;
+            }
+
+            if (zend_hash_index_find(
+                    HASH_OF(*val), 0, (void **)&tmp) == SUCCESS)
+            {
+                HS_REQUEST_DELIM(buf);
+                hs_request_string(buf, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
+            }
+
+            if (zend_hash_index_find(
+                    HASH_OF(*val), 1, (void **)&tmp) == SUCCESS)
+            {
+                HS_REQUEST_DELIM(buf);
+                hs_request_string(buf, Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
+            }
+
+            if (zend_hash_index_find(
+                    HASH_OF(*val), 2, (void **)&tmp) == SUCCESS)
+            {
+                HS_REQUEST_DELIM(buf);
+                hs_request_zval_scalar(buf, *tmp, 0);
+            }
+
+            if (zend_hash_index_find(
+                    HASH_OF(*val), 3, (void **)&tmp) == SUCCESS)
+            {
+                HS_REQUEST_DELIM(buf);
+
+                if (Z_TYPE_PP(tmp) == IS_ARRAY)
+                {
+                    hs_request_array(buf, HASH_OF(*tmp), 1, 0 TSRMLS_CC);
+                }
+                else
+                {
+                    hs_request_zval_scalar(buf, *tmp, 0);
+                }
+            }
+
+            zend_hash_move_forward_ex(ht, &pos);
+        }
+    }
+}
+
+static int hs_request_find_modify(
+    smart_str *buf, zval *update, zval *values, long field TSRMLS_DC)
+{
+    int ret = -1;
+    long len;
+
+    if (update == NULL || Z_TYPE_P(update) != IS_STRING)
     {
         return -1;
     }
 
-    if (Z_TYPE_P(query) == IS_ARRAY)
+    len = Z_STRLEN_P(update);
+    if (len == 1)
     {
-        char *key;
-        uint key_len;
-        ulong index;
-        HashTable *ht;
-        zval **tmp;
+        ret = 1;
+    }
+    else if (len == 2)
+    {
+        ret = 0;
+    }
+    else
+    {
+        return -1;
+    }
 
-        ht = HASH_OF(query);
+    if (values == NULL)
+    {
+        HS_REQUEST_DELIM(buf);
+        hs_request_string(buf, Z_STRVAL_P(update), Z_STRLEN_P(update));
 
-        if (zend_hash_get_current_data_ex(ht, (void **)&tmp, NULL) != SUCCESS)
+        HS_REQUEST_DELIM(buf);
+        HS_REQUEST_NULL(buf);
+    }
+    else if (Z_TYPE_P(values) == IS_ARRAY)
+    {
+        if (field > 0 &&
+            zend_hash_num_elements(HASH_OF(values)) < field)
         {
             return -1;
         }
 
-        if (zend_hash_get_current_key_ex(
-                ht, &key, &key_len, &index, 0, NULL) == HASH_KEY_IS_STRING)
-        {
-            ZVAL_STRINGL(operate, key, key_len - 1, 1);
-            *criteria = *tmp;
-        }
-        else
-        {
-            ZVAL_STRINGL(operate, defaults, strlen(defaults), 1);
-            *criteria = query;
-        }
+        HS_REQUEST_DELIM(buf);
+        hs_request_string(buf, Z_STRVAL_P(update), Z_STRLEN_P(update));
+
+        HS_REQUEST_DELIM(buf);
+        hs_request_array(buf, HASH_OF(values), 0, -1 TSRMLS_CC);
     }
     else
     {
-        ZVAL_STRINGL(operate, defaults, strlen(defaults), 1);
-        *criteria = query;
+        if (field > 0 && field != 1)
+        {
+            return -1;
+        }
+
+        HS_REQUEST_DELIM(buf);
+        hs_request_string(buf, Z_STRVAL_P(update), Z_STRLEN_P(update));
+
+        HS_REQUEST_DELIM(buf);
+        hs_request_zval_scalar(buf, values, 0);
+    }
+
+    return ret;
+}
+
+static long hs_request_send(php_hs_t *hs, smart_str *request TSRMLS_DC)
+{
+    long ret;
+#ifdef HS_DEBUG
+    long i;
+    smart_str debug = {0};
+
+    if (request->len <= 0)
+    {
+        return -1;
+    }
+
+    for (i = 0; i < request->len; i++)
+    {
+        if ((unsigned char)request->c[i] == HS_CODE_NULL)
+        {
+            smart_str_appendl_ex(&debug, "\\0", strlen("\\0"), 1);
+        }
+        else
+        {
+            smart_str_appendc(&debug, request->c[i]);
+        }
+    }
+    smart_str_0(&debug);
+
+    zend_error(
+        E_WARNING,
+        "[handlersocket] (request) %ld : \"%s\"", request->len, debug.c);
+
+    smart_str_free(&debug);
+#endif
+
+    ret = php_stream_write(hs->stream, request->c, request->len);
+
+    return ret;
+}
+
+static long hs_response_select(php_hs_t *hs TSRMLS_DC)
+{
+    php_socket_t max_fd = 0;
+    int retval, max_set_count = 0;
+    struct timeval tv;
+    struct timeval *tv_p = NULL;
+    fd_set fds;
+
+    FD_ZERO(&fds);
+
+    if (php_stream_cast(
+            hs->stream,
+            PHP_STREAM_AS_FD_FOR_SELECT | PHP_STREAM_CAST_INTERNAL,
+            (void*)&max_fd, 1) == SUCCESS &&
+        max_fd != -1)
+    {
+        PHP_SAFE_FD_SET(max_fd, &fds);
+        max_set_count++;
+    }
+
+    PHP_SAFE_MAX_FD(max_fd, max_set_count);
+
+    if (hs->timeout > 0)
+    {
+        tv.tv_sec = hs->timeout;
+        tv.tv_usec = 0;
+        tv_p = &tv;
+    }
+
+    retval = php_select(max_fd + 1, &fds, NULL, NULL, tv_p);
+    if (retval == -1)
+    {
+        zend_error(E_WARNING, "[handlersocket] unable to select");
+        return -1;
+    }
+
+    if (!PHP_SAFE_FD_ISSET(max_fd, &fds))
+    {
+        return -1;
     }
 
     return 0;
 }
 
-static int hs_request_find_execute(
-    php_hs_t *hs, long id,
-    zval *operate, zval *criteria,
-    zval *update, zval *values, long field,
-    long limit, long offset,
-    zval *filters, long in_key, zval *in_values TSRMLS_DC)
+static long hs_response_recv(php_hs_t *hs, char *recv, size_t size TSRMLS_DC)
 {
-    int ret = 0;
-    dena::string_ref operate_str, update_str;
-    std::vector<dena::string_ref> criteria_vec, in_vec, values_vec;
-    std::vector<dena::hstcpcli_filter> filter_vec;
+    long ret;
+#ifdef HS_DEBUG
+    long i;
+    smart_str debug = {0};
+#endif
 
-    convert_to_string(operate);
-    operate_str = dena::string_ref(Z_STRVAL_P(operate), Z_STRLEN_P(operate));
-
-    if (strcmp(Z_STRVAL_P(operate), HS_PROTOCOL_INSERT) == 0)
+    ret  = php_stream_read(hs->stream, recv, size);
+    if (ret <= 0)
     {
-        ret = 1;
+        return -1;
     }
 
-    if (Z_TYPE_P(criteria) == IS_ARRAY)
+#ifdef HS_DEBUG
+    for (i = 0; i < ret; i++)
     {
-        hs_array_to_vector(criteria, criteria_vec TSRMLS_CC);
-    }
-    else if (Z_TYPE_P(criteria) == IS_NULL)
-    {
-        criteria_vec.push_back(dena::string_ref());
-    }
-    else
-    {
-        convert_to_string(criteria);
-        criteria_vec.push_back(
-            dena::string_ref(Z_STRVAL_P(criteria), Z_STRLEN_P(criteria)));
-    }
-
-    /* update */
-    if (update != NULL && Z_TYPE_P(update) != IS_NULL)
-    {
-        long len;
-
-        convert_to_string(update);
-        update_str = dena::string_ref(Z_STRVAL_P(update), Z_STRLEN_P(update));
-
-        len = Z_STRLEN_P(update);
-        if (len == 1 || len != 2)
+        if ((unsigned char)recv[i] == HS_CODE_NULL)
         {
-            ret = 1;
-        }
-
-        if (values != NULL)
-        {
-            if (Z_TYPE_P(values) == IS_ARRAY)
-            {
-                if (field <= 0 ||
-                    zend_hash_num_elements(HASH_OF(values)) >= field)
-                {
-                    hs_array_to_vector(values, values_vec TSRMLS_CC);
-                }
-            }
-            else
-            {
-                if (field <= 0 || field == 1)
-                {
-                    if (Z_TYPE_P(values) == IS_NULL)
-                    {
-                        values_vec.push_back(dena::string_ref());
-                    }
-                    else
-                    {
-                        convert_to_string(values);
-                        values_vec.push_back(
-                            dena::string_ref(
-                                Z_STRVAL_P(values), Z_STRLEN_P(values)));
-                    }
-                }
-            }
-        }
-    }
-
-    /* in */
-    if (in_key >= 0 && in_values != NULL)
-    {
-        if (Z_TYPE_P(in_values) == IS_ARRAY)
-        {
-            hs_array_to_vector(in_values, in_vec TSRMLS_CC);
+            smart_str_appendl_ex(&debug, "\\0", strlen("\\0"), 1);
         }
         else
         {
-            convert_to_string(in_values);
-            in_vec.push_back(
-                dena::string_ref(Z_STRVAL_P(in_values), Z_STRLEN_P(in_values)));
+            smart_str_appendc(&debug, recv[i]);
         }
     }
+    smart_str_0(&debug);
 
-    /* filter */
-    if (filters != NULL && Z_TYPE_P(filters) == IS_ARRAY)
-    {
-        hs_array_to_vector_filter(filter_vec, HASH_OF(filters) TSRMLS_CC);
-    }
+    zend_error(
+        E_WARNING, "[handlersocket] (recv) %ld : \"%s\"", ret, debug.c);
 
-    hs->cli->request_buf_exec_generic(
-        id, operate_str,
-        &criteria_vec[0], criteria_vec.size(),
-        limit, offset,
-        update_str, &values_vec[0], values_vec.size(),
-        &filter_vec[0], filter_vec.size(),
-        in_key, &in_vec[0], in_vec.size());
+    smart_str_free(&debug);
+#endif
 
     return ret;
 }
 
-static void hs_response_value(
-    php_hs_t *hs, zval *return_value, size_t count, int modify TSRMLS_DC)
+static zval* hs_response_add(zval *return_value TSRMLS_DC)
 {
-    const dena::string_ref *row = 0;
+    zval *value;
+    MAKE_STD_ZVAL(value);
+    array_init(value);
+    add_next_index_zval(return_value, value);
+    return value;
+}
 
-    if (modify)
+static zval* hs_response_zval(smart_str *buf TSRMLS_DC)
+{
+    zval *val;
+    MAKE_STD_ZVAL(val);
+    ZVAL_STRINGL(val, buf->c, buf->len, 1);
+    return val;
+}
+
+static void hs_response_value(
+    php_hs_t *hs, zval *error, zval *return_value, int modify TSRMLS_DC)
+{
+    char *recv;
+    long i, j, len;
+    zval *val, *item;
+
+    smart_str response = {0};
+    long n = 0, block_size = HS_SOCKET_BLOCK_SIZE;
+    int escape = 0, flag = 0, null = 0;
+    long ret[2] = {-1, -1};
+
+    if (hs_response_select(hs TSRMLS_CC) < 0)
     {
-        if ((row = hs->cli->get_next_row()) != 0)
-        {
-            const dena::string_ref& v = row[0];
+        ZVAL_BOOL(return_value, 0);
+    }
 
-            if (v.begin() != 0)
+    recv = emalloc(block_size + 1);
+    len = hs_response_recv(hs, recv, block_size TSRMLS_CC);
+    if (len <= 0)
+    {
+        efree(recv);
+        ZVAL_BOOL(return_value, 0);
+        return;
+    }
+
+    do
+    {
+        for (i = 0; i < len; i++)
+        {
+            if (recv[i] == HS_CODE_DELIMITER || recv[i] == HS_CODE_EOL)
             {
-                ZVAL_STRINGL(return_value, (char *)v.begin(), v.size(), 1);
-                convert_to_long(return_value);
+                val = hs_response_zval(&response TSRMLS_CC);
+                convert_to_long(val);
+                ret[flag] = Z_LVAL_P(val);
+                flag++;
+                zval_ptr_dtor(&val);
+                smart_str_free(&response);
             }
             else
             {
-                ZVAL_LONG(return_value, 1);
+                smart_str_appendc(&response, recv[i]);
             }
+
+            if (flag > 1)
+            {
+                break;
+            }
+        }
+
+        if (flag > 1)
+        {
+            break;
         }
         else
         {
-            ZVAL_LONG(return_value, 1);
+            i = 0;
+            len = hs_response_recv(hs, recv, block_size TSRMLS_CC);
+            if (len <= 0)
+            {
+                break;
+            }
         }
+    } while (1);
+
+    if (ret[0] != 0)
+    {
+        if (recv[i] != HS_CODE_EOL)
+        {
+            smart_str err = {0};
+
+            i++;
+
+            if (i > len)
+            {
+                i = 0;
+                len = -1;
+            }
+
+            do
+            {
+                for (j = i; j < len; j++)
+                {
+                    if (recv[j] == HS_CODE_EOL)
+                    {
+                        break;
+                    }
+
+                    if (recv[j] == HS_CODE_ESCAPE_PREFIX)
+                    {
+                        escape = 1;
+                    }
+                    else if (escape)
+                    {
+                        escape = 0;
+                        smart_str_appendc(
+                            &err, (unsigned char)recv[j] - HS_CODE_ESCAPE_ADD);
+                    }
+                    else
+                    {
+                        smart_str_appendc(&err, recv[j]);
+                    }
+                }
+
+                if (recv[j] == HS_CODE_EOL)
+                {
+                    break;
+                }
+
+                i = 0;
+            } while ((len = hs_response_recv(
+                          hs, recv, block_size TSRMLS_CC)) > 0);
+
+            if (error)
+            {
+                ZVAL_STRINGL(error, err.c, err.len, 1);
+            }
+
+            smart_str_free(&err);
+        }
+        else if (error)
+        {
+            ZVAL_NULL(error);
+        }
+
+        efree(recv);
+        ZVAL_BOOL(return_value, 0);
+
+        return;
+    }
+
+    if (ret[1] == 1 && recv[i] == HS_CODE_EOL)
+    {
+        efree(recv);
+        ZVAL_BOOL(return_value, 1);
+        return;
+    }
+
+    i++;
+
+    if (i > len)
+    {
+        i = 0;
+        len = -1;
+    }
+
+    if (modify)
+    {
+        if (i > 0 && recv[i-1] == HS_CODE_EOL)
+        {
+            efree(recv);
+            ZVAL_LONG(return_value, 0);
+            return;
+        }
+
+        do
+        {
+            for (j = i; j < len; j++)
+            {
+                if (recv[j] == HS_CODE_EOL)
+                {
+                    ZVAL_STRINGL(return_value, response.c, response.len, 1);
+                    break;
+                }
+
+                if (recv[j] == HS_CODE_ESCAPE_PREFIX)
+                {
+                    escape = 1;
+                }
+                else if (escape)
+                {
+                    escape = 0;
+                    smart_str_appendc(
+                        &response, (unsigned char)recv[j] - HS_CODE_ESCAPE_ADD);
+                }
+                else
+                {
+                    smart_str_appendc(&response, recv[j]);
+                }
+            }
+
+            if (recv[j] == HS_CODE_EOL)
+            {
+                break;
+            }
+            i = 0;
+        } while ((len = hs_response_recv(hs, recv, block_size TSRMLS_CC)) > 0);
+
+        convert_to_long(return_value);
     }
     else
     {
         array_init(return_value);
 
-        while ((row = hs->cli->get_next_row()) != 0)
+        if (i > 0 && recv[i-1] == HS_CODE_EOL)
         {
-            size_t i;
-            zval *value;
+            efree(recv);
+            return;
+        }
 
-            ALLOC_INIT_ZVAL(value);
+        item = hs_response_add(return_value TSRMLS_CC);
 
-            array_init_size(value, count);
-
-            for (i = 0; i < count; ++i)
+        do
+        {
+            for (j = i; j < len; j++)
             {
-                const dena::string_ref& v = row[i];
-                if (v.begin() != 0)
+                if (recv[j] == HS_CODE_DELIMITER)
                 {
-                    add_next_index_stringl(
-                        value, (char *)v.begin(), v.size(), 1);
+                    if (response.len == 0 && null == 1)
+                    {
+                        add_next_index_null(item);
+                    }
+                    else
+                    {
+                        add_next_index_stringl(
+                            item, response.c, response.len, 1);
+                    }
+
+                    n++;
+                    null = 0;
+                    if (n == ret[1])
+                    {
+                        item = hs_response_add(return_value TSRMLS_CC);
+                        n = 0;
+                    }
+
+                    smart_str_free(&response);
+
+                    continue;
+                }
+                else if (recv[j] == HS_CODE_EOL)
+                {
+                    if (response.len == 0 && null == 1)
+                    {
+                        add_next_index_null(item);
+                    }
+                    else
+                    {
+                        add_next_index_stringl(
+                            item, response.c, response.len, 1);
+                    }
+                    null = 0;
+                    break;
+                }
+
+                if (recv[j] == HS_CODE_ESCAPE_PREFIX)
+                {
+                    escape = 1;
+                }
+                else if (escape)
+                {
+                    escape = 0;
+                    smart_str_appendc(
+                        &response, (unsigned char)recv[j] - HS_CODE_ESCAPE_ADD);
+                }
+                else if (recv[j] == HS_CODE_NULL)
+                {
+                    null = 1;
                 }
                 else
                 {
-                    add_next_index_null(value);
+                    smart_str_appendc(&response, recv[j]);
                 }
             }
 
-            add_next_index_zval(return_value, value);
-        }
+            if (recv[j] == HS_CODE_EOL)
+            {
+                break;
+            }
+            i = 0;
+        } while ((len = hs_response_recv(hs, recv, block_size TSRMLS_CC)) > 0);
     }
+
+    efree(recv);
+
+    smart_str_free(&response);
+}
+
+static void hs_response_multi(
+    php_hs_t *hs, zval *return_value, zval *rmodify, zval *error TSRMLS_DC)
+{
+    char *recv;
+    long i, len, count;
+    long current = 0;
+    smart_str response = {0};
+    long block_size = HS_SOCKET_BLOCK_SIZE;
+
+    if (hs_response_select(hs TSRMLS_CC) < 0)
+    {
+        ZVAL_BOOL(return_value, 0);
+    }
+
+    recv = emalloc(block_size + 1);
+    len = hs_response_recv(hs, recv, block_size TSRMLS_CC);
+    if (len <= 0)
+    {
+        efree(recv);
+        RETVAL_BOOL(0);
+    }
+
+    count = zend_hash_num_elements(HASH_OF(rmodify));
+
+    array_init(return_value);
+
+    array_init(error);
+
+    for(i = 0; i < count; i++)
+    {
+        long j, k;
+        zval *rval, *item, *val, **tmp;
+
+        int flag = 0, escape = 0, null = 0;
+        long n = 0, modify = 0;
+        long ret[2] = {-1, -1};
+
+        if (zend_hash_index_find(
+                HASH_OF(rmodify), i, (void **)&tmp) == SUCCESS)
+        {
+            modify = Z_LVAL_PP(tmp);
+        }
+
+        smart_str_free(&response);
+
+        do
+        {
+            for (j = current; j < len; j++)
+            {
+                if (recv[j] == HS_CODE_DELIMITER || recv[j] == HS_CODE_EOL)
+                {
+                    rval = hs_response_zval(&response TSRMLS_CC);
+                    convert_to_long(rval);
+                    ret[flag] = Z_LVAL_P(rval);
+                    flag++;
+                    zval_ptr_dtor(&rval);
+                    smart_str_free(&response);
+                }
+                else
+                {
+                    smart_str_appendc(&response, recv[j]);
+                }
+
+                if (flag > 1)
+                {
+                    break;
+                }
+            }
+
+            if (flag > 1)
+            {
+                break;
+            }
+            else
+            {
+                j = 0;
+                current = 0;
+                len = hs_response_recv(hs, recv, block_size TSRMLS_CC);
+                if (len <= 0)
+                {
+                    break;
+                }
+            }
+        } while (1);
+
+
+        if (ret[0] != 0)
+        {
+            if (recv[j] != HS_CODE_EOL)
+            {
+                smart_str err = {0};
+
+                j++;
+
+                if (j > len)
+                {
+                    j = 0;
+                    current = 0;
+                    len = -1;
+                }
+
+                do
+                {
+                    for (k = j; k < len; k++)
+                    {
+                        if (recv[k] == HS_CODE_EOL)
+                        {
+                            break;
+                        }
+
+                        if (recv[k] == HS_CODE_ESCAPE_PREFIX)
+                        {
+                            escape = 1;
+                        }
+                        else if (escape)
+                        {
+                            escape = 0;
+                            smart_str_appendc(
+                                &err,
+                                (unsigned char)recv[k] - HS_CODE_ESCAPE_ADD);
+                        }
+                        else
+                        {
+                            smart_str_appendc(&err, recv[k]);
+                        }
+                    }
+
+                    if (recv[k] == HS_CODE_EOL)
+                    {
+                        current = k;
+                        break;
+                    }
+
+                    j = 0;
+                    current = 0;
+
+                } while ((len = hs_response_recv(
+                              hs, recv, block_size TSRMLS_CC)) > 0);
+
+                add_next_index_stringl(error, err.c, err.len, 1);
+
+                smart_str_free(&err);
+            }
+            else
+            {
+                add_next_index_null(error);
+            }
+
+            add_next_index_bool(return_value, 0);
+
+            current++;
+
+            continue;
+        }
+
+        add_next_index_null(error);
+
+        if (ret[1] == 1 && recv[j] == HS_CODE_EOL)
+        {
+            add_next_index_bool(return_value, 1);
+
+            current = j + 1;
+
+            continue;
+        }
+
+        j++;
+
+        if (j > len)
+        {
+            j = 0;
+            current = 0;
+            len = -1;
+        }
+
+        if (modify)
+        {
+            zval *num_z;
+
+            if (j > 0 && recv[j-1] == HS_CODE_EOL)
+            {
+                current = j;
+
+                add_next_index_long(return_value, 0);
+
+                continue;
+            }
+
+            MAKE_STD_ZVAL(num_z);
+
+            do
+            {
+                for (k = j; k < len; k++)
+                {
+                    if (recv[k] == HS_CODE_EOL)
+                    {
+                        ZVAL_STRINGL(num_z, response.c, response.len, 1);
+                        break;
+                    }
+
+                    if (recv[k] == HS_CODE_ESCAPE_PREFIX)
+                    {
+                        escape = 1;
+                    }
+                    else if (escape)
+                    {
+                        escape = 0;
+                        smart_str_appendc(
+                            &response,
+                            (unsigned char)recv[k] - HS_CODE_ESCAPE_ADD);
+                    }
+                    else
+                    {
+                        smart_str_appendc(&response, recv[k]);
+                    }
+                }
+
+                if (recv[k] == HS_CODE_EOL)
+                {
+                    current = k;
+                    break;
+                }
+
+                j = 0;
+                current = 0;
+
+            } while ((len = hs_response_recv(
+                          hs, recv, block_size TSRMLS_CC)) > 0);
+
+            convert_to_long(num_z);
+
+            add_next_index_long(return_value, Z_LVAL_P(num_z));
+
+            zval_ptr_dtor(&num_z);
+        }
+        else
+        {
+            item = hs_response_add(return_value TSRMLS_CC);
+
+            if (j > 0 && recv[j-1] == HS_CODE_EOL)
+            {
+                current = j;
+
+                continue;
+            }
+
+            val = hs_response_add(item TSRMLS_CC);
+
+            do
+            {
+                for (k = j; k < len; k++)
+                {
+                    if (recv[k] == HS_CODE_DELIMITER)
+                    {
+                        if (response.len == 0 && null == 1)
+                        {
+                            add_next_index_null(val);
+                        }
+                        else
+                        {
+                            add_next_index_stringl(
+                                val, response.c, response.len, 1);
+                        }
+
+                        null = 0;
+                        n++;
+                        if (n == ret[1])
+                        {
+                            val = hs_response_add(item TSRMLS_CC);
+                            n = 0;
+                        }
+
+                        smart_str_free(&response);
+
+                        continue;
+                    }
+                    else if (recv[k] == HS_CODE_EOL)
+                    {
+                        if (response.len == 0 && null == 1)
+                        {
+                            add_next_index_null(val);
+                        }
+                        else
+                        {
+                            add_next_index_stringl(
+                                val, response.c, response.len, 1);
+                        }
+                        null = 0;
+                        break;
+                    }
+
+                    if (recv[k] == HS_CODE_ESCAPE_PREFIX)
+                    {
+                        escape = 1;
+                    }
+                    else if (escape)
+                    {
+                        escape = 0;
+                        smart_str_appendc(
+                            &response,
+                            (unsigned char)recv[k] - HS_CODE_ESCAPE_ADD);
+                    }
+                    else if (recv[k] == HS_CODE_NULL)
+                    {
+                        null = 1;
+                    }
+                    else
+                    {
+                        smart_str_appendc(&response, recv[k]);
+                    }
+                }
+
+                if (recv[k] == HS_CODE_EOL)
+                {
+                    current = k;
+                    break;
+                }
+
+                j = 0;
+                current = 0;
+
+            } while ((len = hs_response_recv(
+                          hs, recv, block_size TSRMLS_CC)) > 0);
+        }
+
+        current++;
+    }
+
+    efree(recv);
+
+    smart_str_free(&response);
 }
 
 static int hs_is_options_safe(HashTable *options TSRMLS_DC)
@@ -1160,10 +1961,19 @@ static void hs_free(php_hs_t *hs TSRMLS_DC)
 {
     if (hs)
     {
-        if (hs->cli)
+        if (hs->stream)
         {
-            hs->cli->close();
-            delete hs->cli;
+            php_stream_close(hs->stream);
+        }
+
+        if (hs->server)
+        {
+            zval_ptr_dtor(&hs->server);
+        }
+
+        if (hs->auth)
+        {
+            zval_ptr_dtor(&hs->auth);
         }
 
         if (hs->error)
@@ -1200,25 +2010,31 @@ static zend_object_value hs_new(zend_class_entry *ce TSRMLS_DC)
         NULL TSRMLS_CC);
     retval.handlers = zend_get_std_object_handlers();
 
-    hs->cli = NULL;
+    hs->stream = NULL;
+    hs->server = NULL;
+    hs->auth = NULL;
     hs->error = NULL;
+
     return retval;
 }
 
 static ZEND_METHOD(HandlerSocket, __construct)
 {
-    char *host = NULL, *port = NULL;
+    char *host, *port, *server = NULL;
     int host_len, port_len, server_len;
     zval *options = NULL;
 
-    php_hs_t *hs;
+    char *hashkey = NULL, *errstr = NULL;
+    int err;
+    struct timeval tv;
 
-    dena::config conf;
-    dena::socket_args args;
-    dena::hstcpcli_ptr cli;
+    php_hs_t *hs;
 
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
+
+    MAKE_STD_ZVAL(hs->server);
+    hs->timeout = FG(default_socket_timeout);
 
     if (zend_parse_parameters(
             ZEND_NUM_ARGS() TSRMLS_CC, "ss|z",
@@ -1227,7 +2043,7 @@ static ZEND_METHOD(HandlerSocket, __construct)
         return;
     }
 
-    if ((strlen(host) == 0 || strlen(port) == 0) &&  options == NULL)
+    if (strlen(host) == 0 || strlen(port) == 0)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -1235,37 +2051,60 @@ static ZEND_METHOD(HandlerSocket, __construct)
         RETURN_FALSE;
     }
 
-    if (strlen(host) > 0)
-    {
-        conf["host"] = std::string(host);
-    }
-
-    if (strlen(port) > 0)
-    {
-        conf["port"] = std::string(port);
-    }
-
     if (options && Z_TYPE_P(options) == IS_ARRAY)
     {
-        hs_array_to_conf(HASH_OF(options), conf TSRMLS_CC);
+        zval **tmp;
+
+        if (zend_hash_find(
+                Z_ARRVAL_P(options), "timeout", sizeof("timeout"),
+                (void **)&tmp) == SUCCESS)
+        {
+            convert_to_long_ex(tmp);
+            hs->timeout = Z_LVAL_PP(tmp);
+        }
     }
 
-    args.set(conf);
+    server_len = spprintf(&server, 0, "%s:%s", host, port);
+    ZVAL_STRINGL(hs->server, server, server_len, 1);
+    efree(server);
 
-    cli = dena::hstcpcli_i::create(args);
-    hs->cli = cli.get();
-    cli.release();
-
-    if (hs->cli->get_error_code() < 0)
+    if (hs->timeout > 0)
     {
-        hs->cli->close();
-        delete hs->cli;
-        hs->cli = NULL;
+        tv.tv_sec = hs->timeout;
+        tv.tv_usec = 0;
+    }
 
+    hs->stream = php_stream_xport_create(
+        Z_STRVAL_P(hs->server), Z_STRLEN_P(hs->server),
+        ENFORCE_SAFE_MODE | REPORT_ERRORS,
+        STREAM_XPORT_CLIENT | STREAM_XPORT_CONNECT,
+        hashkey, &tv, NULL, &errstr, &err);
+    if (!hs->stream)
+    {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
-            "[handlersocket] unable to connect %s:%s", host, port);
+            "[handlersocket] unable to connect %s: %s",
+            Z_STRVAL_P(hs->server),
+            errstr == NULL ? "Unknown error" : errstr);
         RETURN_FALSE;
+    }
+
+    if (hashkey)
+    {
+        efree(hashkey);
+    }
+
+    if (errstr)
+    {
+        efree(errstr);
+    }
+
+    /* non-blocking */
+    if (php_stream_set_option(
+            hs->stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL) == -1)
+    {
+        zend_error(
+            E_WARNING, "[handlersocket] Un set non-blocking mode on a stream");
     }
 }
 
@@ -1273,7 +2112,9 @@ static ZEND_METHOD(HandlerSocket, auth)
 {
     long key_len, type_len;
     char *key, *type;
-    size_t num_flds;
+
+    zval *retval;
+    smart_str request = {0};
 
     php_hs_t *hs;
 
@@ -1293,58 +2134,56 @@ static ZEND_METHOD(HandlerSocket, auth)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
 
-    hs->cli->request_buf_auth(key, "1"); /* type: 1 */
-    if (hs->cli->get_error_code() < 0)
-    {
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-        RETURN_FALSE;
-    }
+    MAKE_STD_ZVAL(hs->auth);
+    ZVAL_STRINGL(hs->auth, key, key_len, 1);
 
-    if (hs->cli->request_send() != 0 ||
-        hs->cli->response_recv(num_flds) < 0)
+    MAKE_STD_ZVAL(retval);
+
+    hs_request_string(&request, HS_PROTOCOL_AUTH, 1);
+    HS_REQUEST_DELIM(&request);
+    hs_request_string(&request, "1", 1);
+    HS_REQUEST_DELIM(&request);
+    hs_request_string(&request, Z_STRVAL_P(hs->auth), Z_STRLEN_P(hs->auth));
+    HS_REQUEST_NEXT(&request);
+
+    /* request: send */
+    if (hs_request_send(hs, &request TSRMLS_CC) >= 0)
     {
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-        ZVAL_BOOL(return_value, 0);
-    }
-    else
-    {
-        if (hs->cli->get_error_code() != 0)
-        {
-            ZVAL_STRINGL(
-                hs->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-            ZVAL_BOOL(return_value, 0);
-        }
-        else
+        /* response */
+        hs_response_value(hs, NULL, retval, 0 TSRMLS_CC);
+
+        if (Z_TYPE_P(retval) == IS_BOOL &&
+            Z_LVAL_P(retval) == 1)
         {
             ZVAL_BOOL(return_value, 1);
         }
+        else
+        {
+            ZVAL_BOOL(return_value, 0);
+        }
+    }
+    else
+    {
+        ZVAL_BOOL(return_value, 0);
     }
 
-    hs->cli->response_buf_remove();
+    smart_str_free(&request);
+
+    zval_ptr_dtor(&retval);
 }
 
 static ZEND_METHOD(HandlerSocket, openIndex)
 {
     long id;
-    char *db, *table, *index, *filters_cstr = NULL;
+    char *db, *table, *index;
     int db_len, table_len, index_len;
     zval *field = NULL, *filters = NULL;
-
-    std::string request_field, request_filter;
-    size_t num_flds;
+    smart_str request = {0}, request_field = {0};
 
     php_hs_t *hs;
 
@@ -1360,89 +2199,115 @@ static ZEND_METHOD(HandlerSocket, openIndex)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
 
-    /* field */
     if (Z_TYPE_P(field) == IS_ARRAY)
     {
-        hs_array_to_string(request_field, HASH_OF(field) TSRMLS_CC);
+        zval **tmp;
+        HashPosition pos;
+        long n;
+
+        n = zend_hash_num_elements(HASH_OF(field));
+        if (n >= 0)
+        {
+            zend_hash_internal_pointer_reset_ex(HASH_OF(field), &pos);
+            while (zend_hash_get_current_data_ex(
+                       HASH_OF(field), (void **)&tmp, &pos) == SUCCESS)
+            {
+                switch ((*tmp)->type)
+                {
+                    case IS_STRING:
+                        smart_str_appendl_ex(
+                            &request_field,
+                            Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp), 1);
+                        break;
+                    default:
+                        convert_to_string(*tmp);
+                        smart_str_appendl_ex(
+                            &request_field,
+                            Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp), 1);
+                        break;
+                }
+
+                smart_str_appendl_ex(&request_field, ",", strlen(","), 1);
+
+                zend_hash_move_forward_ex(HASH_OF(field), &pos);
+            }
+
+            request_field.len--;
+            request_field.a--;
+        }
+
     }
     else if (Z_TYPE_P(field) == IS_STRING)
     {
-        request_field.append(Z_STRVAL_P(field), Z_STRLEN_P(field));
+        smart_str_appendl_ex(
+            &request_field, Z_STRVAL_P(field), Z_STRLEN_P(field), 1);
     }
     else
     {
         convert_to_string(field);
-        request_field.append(Z_STRVAL_P(field), Z_STRLEN_P(field));
+        smart_str_appendl_ex(
+            &request_field, Z_STRVAL_P(field), Z_STRLEN_P(field), 1);
     }
+
+    hs_request_string(&request, HS_PROTOCOL_OPEN, 1);
+    HS_REQUEST_DELIM(&request);
+
+    /* id */
+    HS_REQUEST_LONG(&request, id);
+    HS_REQUEST_DELIM(&request);
+
+    /* db */
+    hs_request_string(&request, db, db_len);
+    HS_REQUEST_DELIM(&request);
+
+    /* table */
+    hs_request_string(&request, table, table_len);
+    HS_REQUEST_DELIM(&request);
+
+    /* index */
+    hs_request_string(&request, index, index_len);
+    HS_REQUEST_DELIM(&request);
+
+    /* field */
+    hs_request_string(&request, request_field.c, request_field.len);
 
     /* filter */
     if (filters)
     {
         if (Z_TYPE_P(filters) == IS_ARRAY)
         {
-            hs_array_to_string(request_filter, HASH_OF(filters) TSRMLS_CC);
+            hs_request_filter(&request, HASH_OF(filters) TSRMLS_CC);
         }
         else
         {
-            convert_to_string(filters);
-            request_filter.append(Z_STRVAL_P(filters), Z_STRLEN_P(filters));
+            HS_REQUEST_DELIM(&request);
+            hs_request_zval_scalar(&request, filters, 0);
         }
-
-        filters_cstr = (char *)request_filter.c_str();
     }
 
-    hs->cli->request_buf_open_index(
-        id, db, table, index, request_field.c_str(), filters_cstr);
+    /* eol */
+    HS_REQUEST_NEXT(&request);
 
-    if (hs->cli->get_error_code() < 0)
+    /* request: send */
+    if (hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
+        smart_str_free(&request);
         RETURN_FALSE;
     }
 
-    if (hs->cli->request_send() != 0)
-    {
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-        RETURN_FALSE;
-    }
-    else
-    {
-        if (hs->cli->response_recv(num_flds) != 0)
-        {
-            ZVAL_STRINGL(
-                hs->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-            ZVAL_BOOL(return_value, 0);
-        }
-        else
-        {
-            if (hs->cli->get_error_code() != 0)
-            {
-                ZVAL_STRINGL(
-                    hs->error,
-                    (char *)hs->cli->get_error().c_str(),
-                    hs->cli->get_error().size(), 1);
-                ZVAL_BOOL(return_value, 0);
-            }
-            else
-            {
-                ZVAL_BOOL(return_value, 1);
-            }
-        }
+    smart_str_free(&request);
 
-        hs->cli->response_buf_remove();
+    /* response */
+    hs_response_value(hs, hs->error, return_value, 0 TSRMLS_CC);
+
+    if (Z_TYPE_P(return_value) == IS_BOOL && Z_LVAL_P(return_value) == 0)
+    {
+        RETURN_FALSE;
     }
 }
 
@@ -1452,10 +2317,11 @@ static ZEND_METHOD(HandlerSocket, executeSingle)
     long limit = 1, offset = 0;
     char *operate, *update = NULL;
     zval *criteria, *values = NULL, *filters = NULL, *in_values = NULL;
-    zval *find_operate = NULL, *find_update = NULL;
-    int modify, field = -1;
+    zval *find_operate = NULL;
 
     php_hs_t *hs;
+
+    smart_str request = {0};
 
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
@@ -1470,7 +2336,7 @@ static ZEND_METHOD(HandlerSocket, executeSingle)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
@@ -1478,9 +2344,17 @@ static ZEND_METHOD(HandlerSocket, executeSingle)
     MAKE_STD_ZVAL(find_operate);
     ZVAL_STRINGL(find_operate, operate, operate_len, 1);
 
-    /* modify */
+    /* find */
+    hs_request_find_execute(
+        &request, id, find_operate, criteria,
+        limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+    /* find: modify */
     if (update_len > 0)
     {
+        int modify, field;
+        zval *find_update;
+
         MAKE_STD_ZVAL(find_update);
         ZVAL_STRINGL(find_update, update, update_len, 1);
 
@@ -1492,61 +2366,70 @@ static ZEND_METHOD(HandlerSocket, executeSingle)
         {
             field = -1;
         }
-    }
 
-    /* find */
-    modify = hs_request_find_execute(
-        hs, id, find_operate, criteria,
-        find_update, values, field,
-        limit, offset, filters, in_key, in_values TSRMLS_CC);
+        modify = hs_request_find_modify(
+            &request, find_update, values, field TSRMLS_CC);
+        if (modify >= 0)
+        {
+            /* eol */
+            HS_REQUEST_NEXT(&request);
 
-    /* request: send */
-    if (hs->cli->request_send() != 0)
-    {
-        ZVAL_BOOL(return_value, 0);
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-    }
-    else
-    {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
+            /* request: send */
+            if (hs_request_send(hs, &request TSRMLS_CC) < 0)
+            {
+                ZVAL_BOOL(return_value, 0);
+            }
+            else
+            {
+                /* response */
+                hs_response_value(hs, hs->error, return_value, modify TSRMLS_CC);
+            }
+        }
+        else
         {
             ZVAL_BOOL(return_value, 0);
             ZVAL_STRINGL(
                 hs->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
+                "[handlersocket] unable to update parameter",
+                strlen("[handlersocket] unable to update parameter"), 1);
+        }
+
+        zval_ptr_dtor(&find_update);
+    }
+    else
+    {
+        /* eol */
+        HS_REQUEST_NEXT(&request);
+
+        /* request: send */
+        if (hs_request_send(hs, &request TSRMLS_CC) < 0)
+        {
+            ZVAL_BOOL(return_value, 0);
         }
         else
         {
-            hs_response_value(hs, return_value, num_flds, modify TSRMLS_CC);
+            /* response */
+            hs_response_value(hs, hs->error, return_value, 0 TSRMLS_CC);
         }
-
-        hs->cli->response_buf_remove();
     }
 
     zval_ptr_dtor(&find_operate);
-    if (find_update)
-    {
-        zval_ptr_dtor(&find_update);
-    }
+
+    smart_str_free(&request);
 }
 
 static ZEND_METHOD(HandlerSocket, executeMulti)
 {
     zval *args = NULL;
-    zval *rmodify, **val;
+    zval *rmodify;
     HashPosition pos;
-    int err = -1;
-    long i, n;
+    zval **val;
+
+    smart_str request = {0};
 
     php_hs_t *hs;
+
+    int err = -1;
 
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
@@ -1557,7 +2440,7 @@ static ZEND_METHOD(HandlerSocket, executeMulti)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
@@ -1570,8 +2453,7 @@ static ZEND_METHOD(HandlerSocket, executeMulti)
                HASH_OF(args), (void **)&val, &pos) == SUCCESS)
     {
         HashTable *ht;
-        long id, in_key = -1, limit = 1, offset = 0;
-        long field, modify;
+        long i, id, n, in_key = -1, limit = 1, offset = 0;
         zval **operate, **criteria, **tmp;
         zval *update = NULL, *values = NULL;
         zval *filters = NULL, *in_values = NULL;
@@ -1612,50 +2494,75 @@ static ZEND_METHOD(HandlerSocket, executeMulti)
 
         for (i = 3; i < n; i++)
         {
-            if (zend_hash_index_find(ht, i, (void **)&tmp) == SUCCESS)
+            switch (i)
             {
-                switch (i)
-                {
-                    case 3:
-                        /* 3: limit */
+                case 3:
+                    /* 3: limit */
+                    if (zend_hash_index_find(ht, 3, (void **)&tmp) == SUCCESS)
+                    {
                         convert_to_long(*tmp);
                         limit = Z_LVAL_PP(tmp);
-                        break;
-                    case 4:
-                        /* 4: offset */
+                    }
+                    break;
+                case 4:
+                    /* 4: offset */
+                    if (zend_hash_index_find(ht, 4, (void **)&tmp) == SUCCESS)
+                    {
                         convert_to_long(*tmp);
                         offset = Z_LVAL_PP(tmp);
-                        break;
-                    case 5:
-                        /* 5: update */
+                    }
+                    break;
+                case 5:
+                    /* 5: update */
+                    if (zend_hash_index_find(ht, 5, (void **)&tmp) == SUCCESS)
+                    {
                         update = *tmp;
-                        break;
-                    case 6:
-                        /* 6: values */
+                    }
+                    break;
+                case 6:
+                    /* 6: values */
+                    if (zend_hash_index_find(ht, 6, (void **)&tmp) == SUCCESS)
+                    {
                         values = *tmp;
-                        break;
-                    case 7:
-                        /* 7: filters */
+                    }
+                    break;
+                case 7:
+                    /* 7: filters */
+                    if (zend_hash_index_find(ht, 7, (void **)&tmp) == SUCCESS)
+                    {
                         filters = *tmp;
-                        break;
-                    case 8:
-                        /* 8: in_key */
+                    }
+                    break;
+                case 8:
+                    /* 8: in_key */
+                    if (zend_hash_index_find(ht, 8, (void **)&tmp) == SUCCESS)
+                    {
                         convert_to_long(*tmp);
                         in_key = Z_LVAL_PP(tmp);
-                        break;
-                    case 9:
-                        /* 9: in_values */
+                    }
+                    break;
+                case 9:
+                    /* 9: in_values */
+                    if (zend_hash_index_find(ht, 9, (void **)&tmp) == SUCCESS)
+                    {
                         in_values = *tmp;
-                        break;
-                    default:
-                        break;
-                }
+                    }
+                    break;
+                default:
+                    break;
             }
         }
 
-        /* modify */
+        /* find */
+        hs_request_find_execute(
+            &request, id, *operate, *criteria,
+            limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+        /* find: modify */
         if (update != NULL && Z_TYPE_P(update) != IS_NULL)
         {
+            int modify, field;
+
             if (values != NULL && Z_TYPE_P(values) == IS_ARRAY)
             {
                 field = zend_hash_num_elements(HASH_OF(values));
@@ -1664,14 +2571,26 @@ static ZEND_METHOD(HandlerSocket, executeMulti)
             {
                 field = -1;
             }
+
+            modify = hs_request_find_modify(
+                &request, update, values, field TSRMLS_CC);
+            if (modify >= 0)
+            {
+                add_next_index_long(rmodify, modify);
+            }
+            else
+            {
+                err = -1;
+                break;
+            }
+        }
+        else
+        {
+            add_next_index_long(rmodify, 0);
         }
 
-        /* find */
-        modify = hs_request_find_execute(
-            hs, id, *operate, *criteria, update, values, field,
-            limit, offset, filters, in_key, in_values TSRMLS_CC);
-
-        add_next_index_long(rmodify, modify);
+        /* eol */
+        HS_REQUEST_NEXT(&request);
 
         err = 0;
 
@@ -1679,62 +2598,16 @@ static ZEND_METHOD(HandlerSocket, executeMulti)
     }
 
     /* request: send */
-    if (err < 0)
+    if (err < 0  || hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
+        smart_str_free(&request);
         zval_ptr_dtor(&rmodify);
         RETURN_FALSE;
     }
+    smart_str_free(&request);
 
-    if (hs->cli->request_send() != 0)
-    {
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-        ZVAL_BOOL(return_value, 0);
-    }
-    else
-    {
-        n = zend_hash_num_elements(HASH_OF(rmodify));
-
-        array_init(return_value);
-        array_init(hs->error);
-
-        for (i = 0; i < n; i++)
-        {
-            zval **tmp;
-            size_t num_flds, modify = 0;
-
-            if (zend_hash_index_find(
-                    HASH_OF(rmodify), i, (void **)&tmp) == SUCCESS)
-            {
-                modify = Z_LVAL_PP(tmp);
-            }
-
-            /* response: recv */
-            if (hs->cli->response_recv(num_flds) != 0 ||
-                hs->cli->get_error_code() != 0)
-            {
-                add_next_index_bool(return_value, 0);
-                add_next_index_stringl(
-                    hs->error,
-                    (char *)hs->cli->get_error().c_str(),
-                    hs->cli->get_error().size(), 1);
-            }
-            else
-            {
-                zval *item;
-                MAKE_STD_ZVAL(item);
-
-                hs_response_value(hs, item, num_flds, modify TSRMLS_CC);
-
-                add_next_index_zval(return_value, item);
-                add_next_index_null(hs->error);
-            }
-
-            hs->cli->response_buf_remove();
-        }
-    }
+    /* response */
+    hs_response_multi(hs, return_value, rmodify, hs->error TSRMLS_CC);
 
     zval_ptr_dtor(&rmodify);
 }
@@ -1746,8 +2619,12 @@ static ZEND_METHOD(HandlerSocket, executeUpdate)
     char *operate;
     zval *criteria, *values = NULL, *filters = NULL, *in_values = NULL;
     zval *find_update, *find_operate = NULL;
+    int modify;
+    long field;
 
     php_hs_t *hs;
+
+    smart_str request = {0};
 
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
@@ -1761,7 +2638,7 @@ static ZEND_METHOD(HandlerSocket, executeUpdate)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
@@ -1769,49 +2646,47 @@ static ZEND_METHOD(HandlerSocket, executeUpdate)
     MAKE_STD_ZVAL(find_operate);
     ZVAL_STRINGL(find_operate, operate, operate_len, 1);
 
-    /* modify */
+    /* find */
+    hs_request_find_execute(
+        &request, id, find_operate, criteria,
+        limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+    /* find: modify */
     MAKE_STD_ZVAL(find_update);
     ZVAL_STRINGL(find_update, HS_MODIFY_UPDATE, 1, 1);
 
-    /* find */
-    hs_request_find_execute(
-        hs, id, find_operate, criteria,
-        find_update, values, -1,
-        limit, offset, filters, in_key, in_values TSRMLS_CC);
+    field = zend_hash_num_elements(HASH_OF(values));
+    modify = hs_request_find_modify(
+        &request, find_update, values, field TSRMLS_CC);
+    if (modify >= 0)
+    {
+        /* eol */
+        HS_REQUEST_NEXT(&request);
 
-    /* request: send */
-    if (hs->cli->request_send() != 0)
+        /* request: send */
+        if (hs_request_send(hs, &request TSRMLS_CC) < 0)
+        {
+            ZVAL_BOOL(return_value, 0);
+        }
+        else
+        {
+            /* response */
+            hs_response_value(hs, hs->error, return_value, modify TSRMLS_CC);
+        }
+    }
+    else
     {
         ZVAL_BOOL(return_value, 0);
         ZVAL_STRINGL(
             hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-    }
-    else
-    {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hs->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, 1 TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+            "[handlersocket] unable to update parameter",
+            strlen("[handlersocket] unable to update parameter"), 1);
     }
 
     zval_ptr_dtor(&find_operate);
     zval_ptr_dtor(&find_update);
+
+    smart_str_free(&request);
 }
 
 static ZEND_METHOD(HandlerSocket, executeDelete)
@@ -1821,8 +2696,11 @@ static ZEND_METHOD(HandlerSocket, executeDelete)
     char *operate;
     zval *criteria, *values = NULL, *filters = NULL, *in_values = NULL;
     zval *find_update, *find_operate = NULL;
+    int modify;
 
     php_hs_t *hs;
+
+    smart_str request = {0};
 
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
@@ -1836,7 +2714,7 @@ static ZEND_METHOD(HandlerSocket, executeDelete)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
@@ -1844,61 +2722,60 @@ static ZEND_METHOD(HandlerSocket, executeDelete)
     MAKE_STD_ZVAL(find_operate);
     ZVAL_STRINGL(find_operate, operate, operate_len, 1);
 
-    /* modify */
+    /* find */
+    hs_request_find_execute(
+        &request, id, find_operate, criteria,
+        limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+    /* find: modify */
     MAKE_STD_ZVAL(find_update);
     ZVAL_STRINGL(find_update, HS_MODIFY_REMOVE, 1, 1);
 
     MAKE_STD_ZVAL(values);
     ZVAL_NULL(values);
 
-    /* find */
-    hs_request_find_execute(
-        hs, id, find_operate, criteria,
-        find_update, values, -1,
-        limit, offset, filters, in_key, in_values TSRMLS_CC);
+    modify = hs_request_find_modify(
+        &request, find_update, values, -1 TSRMLS_CC);
+    if (modify >= 0)
+    {
+        /* eol */
+        HS_REQUEST_NEXT(&request);
 
-    /* request: send */
-    if (hs->cli->request_send() != 0)
+        /* request: send */
+        if (hs_request_send(hs, &request TSRMLS_CC) < 0)
+        {
+            ZVAL_BOOL(return_value, 0);
+        }
+        else
+        {
+            /* response */
+            hs_response_value(hs, hs->error, return_value, modify TSRMLS_CC);
+        }
+    }
+    else
     {
         ZVAL_BOOL(return_value, 0);
         ZVAL_STRINGL(
             hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-    }
-    else
-    {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hs->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, 1 TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+            "[handlersocket] unable to update parameter",
+            strlen("[handlersocket] unable to update parameter"), 1);
     }
 
     zval_ptr_dtor(&find_operate);
     zval_ptr_dtor(&find_update);
     zval_ptr_dtor(&values);
+
+    smart_str_free(&request);
 }
 
 static ZEND_METHOD(HandlerSocket, executeInsert)
 {
-    long id, n;
+    long id;
     zval *operate, *field;
 
     php_hs_t *hs;
+
+    smart_str request = {0};
 
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
@@ -1916,7 +2793,7 @@ static ZEND_METHOD(HandlerSocket, executeInsert)
         RETURN_FALSE;
     }
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         RETURN_FALSE;
     }
@@ -1925,41 +2802,25 @@ static ZEND_METHOD(HandlerSocket, executeInsert)
     ZVAL_STRINGL(operate, HS_PROTOCOL_INSERT, 1, 1);
 
     /* find */
-    hs_request_find_execute(
-        hs, id, operate, field, NULL, NULL, -1, 0, 0, NULL, -1, NULL TSRMLS_CC);
+    hs_request_find(
+        &request, id, operate, field, 0, 0, NULL, -1, NULL TSRMLS_CC);
+
+    /* eol */
+    HS_REQUEST_NEXT(&request);
 
     /* request: send */
-    if (hs->cli->request_send() != 0)
+    if (hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
         ZVAL_BOOL(return_value, 0);
-        ZVAL_STRINGL(
-            hs->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
     }
     else
     {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hs->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, 1 TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+        /* response */
+        hs_response_value(hs, hs->error, return_value, 1 TSRMLS_CC);
     }
 
     zval_ptr_dtor(&operate);
+    smart_str_free(&request);
 }
 
 static ZEND_METHOD(HandlerSocket, getError)
@@ -1984,7 +2845,7 @@ static ZEND_METHOD(HandlerSocket, createIndex)
     long id;
     char *db, *table, *index;
     int db_len, table_len, index_len;
-    zval *fields = NULL, *options = NULL;
+    zval *field = NULL, *options = NULL;
     zval temp;
     zval *id_z, *db_z, *table_z, *index_z, *opt_z = NULL;
 
@@ -1997,7 +2858,7 @@ static ZEND_METHOD(HandlerSocket, createIndex)
     if (zend_parse_parameters(
             ZEND_NUM_ARGS() TSRMLS_CC, "lsssz|z",
             &id, &db, &db_len, &table, &table_len,
-            &index, &index_len, &fields, &options) == FAILURE)
+            &index, &index_len, &field, &options) == FAILURE)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -2031,20 +2892,20 @@ static ZEND_METHOD(HandlerSocket, createIndex)
     {
         HS_METHOD6(
             HandlerSocketIndex, __construct, &temp, return_value,
-            getThis(), id_z, db_z, table_z, index_z, fields);
+            getThis(), id_z, db_z, table_z, index_z, field);
     }
     else if (opt_z != NULL)
     {
         HS_METHOD7(
             HandlerSocketIndex, __construct, &temp, return_value,
-            getThis(), id_z, db_z, table_z, index_z, fields, opt_z);
+            getThis(), id_z, db_z, table_z, index_z, field, opt_z);
         zval_ptr_dtor(&opt_z);
     }
     else
     {
         HS_METHOD7(
             HandlerSocketIndex, __construct, &temp, return_value,
-            getThis(), id_z, db_z, table_z, index_z, fields, options);
+            getThis(), id_z, db_z, table_z, index_z, field, options);
     }
 
     zval_ptr_dtor(&id_z);
@@ -2061,11 +2922,25 @@ static ZEND_METHOD(HandlerSocket, close)
     hs = (php_hs_t *)zend_object_store_get_object(getThis() TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (hs && hs->cli)
+    if (hs)
     {
-        hs->cli->close();
-        delete hs->cli;
-        hs->cli = NULL;
+        if (hs->stream)
+        {
+            php_stream_close(hs->stream);
+        }
+        hs->stream = NULL;
+
+        if (hs->server)
+        {
+            zval_ptr_dtor(&hs->server);
+        }
+        hs->server = NULL;
+
+        if (hs->auth)
+        {
+            zval_ptr_dtor(&hs->auth);
+        }
+        hs->auth = NULL;
     }
 }
 #endif
@@ -2131,13 +3006,11 @@ static ZEND_METHOD(HandlerSocketIndex, __construct)
 {
     zval *link;
     long id;
-    char *db, *table, *index, *filters_cstr = NULL;
+    char *db, *table, *index;
     int db_len, table_len, index_len;
     zval *fields, *opts = NULL;
-    size_t num_flds;
 
-    std::string request_field, request_filter;
-
+    smart_str request = {0}, request_field = {0};
     php_hs_t *hs;
     php_hs_index_t *hsi;
 
@@ -2159,7 +3032,7 @@ static ZEND_METHOD(HandlerSocketIndex, __construct)
     hs = (php_hs_t *)zend_object_store_get_object(link TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -2172,16 +3045,53 @@ static ZEND_METHOD(HandlerSocketIndex, __construct)
 
     if (Z_TYPE_P(fields) == IS_ARRAY)
     {
-        hs_array_to_string(request_field, HASH_OF(fields) TSRMLS_CC);
+        zval **tmp;
+        HashTable *ht;
+        HashPosition pos;
+
+        ht = HASH_OF(fields);
+
+        if (zend_hash_num_elements(ht) >= 0)
+        {
+            zend_hash_internal_pointer_reset_ex(ht, &pos);
+            while (zend_hash_get_current_data_ex(
+                       ht, (void **)&tmp, &pos) == SUCCESS)
+            {
+                switch ((*tmp)->type)
+                {
+                    case IS_STRING:
+                        smart_str_appendl_ex(
+                            &request_field,
+                            Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp), 1);
+                        break;
+                    default:
+                        convert_to_string(*tmp);
+                        smart_str_appendl_ex(
+                            &request_field,
+                            Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp), 1);
+                        break;
+                }
+
+                smart_str_appendl_ex(&request_field, ",", strlen(","), 1);
+
+                zend_hash_move_forward_ex(ht, &pos);
+            }
+
+            request_field.len--;
+            request_field.a--;
+        }
+
     }
     else if (Z_TYPE_P(fields) == IS_STRING)
     {
-        request_field.append(Z_STRVAL_P(fields), Z_STRLEN_P(fields));
+        smart_str_appendl_ex(
+            &request_field, Z_STRVAL_P(fields), Z_STRLEN_P(fields), 1);
     }
     else
     {
         convert_to_string(fields);
-        request_field.append(Z_STRVAL_P(fields), Z_STRLEN_P(fields));
+        smart_str_appendl_ex(
+            &request_field, Z_STRVAL_P(fields), Z_STRLEN_P(fields), 1);
     }
 
     if (opts)
@@ -2198,8 +3108,6 @@ static ZEND_METHOD(HandlerSocketIndex, __construct)
             if (Z_TYPE_PP(tmp) == IS_ARRAY)
             {
                 long n, i;
-
-                hs_array_to_string(request_filter, HASH_OF(*tmp) TSRMLS_CC);
 
                 array_init(hsi->filter);
 
@@ -2220,10 +3128,7 @@ static ZEND_METHOD(HandlerSocketIndex, __construct)
             {
                 zval delim;
 
-                convert_to_string(*tmp);
                 ZVAL_STRINGL(&delim, ",", strlen(","), 0);
-
-                request_filter.append(Z_STRVAL_PP(tmp), Z_STRLEN_PP(tmp));
 
                 array_init(hsi->filter);
                 php_explode(&delim, *tmp, hsi->filter, LONG_MAX);
@@ -2232,37 +3137,60 @@ static ZEND_METHOD(HandlerSocketIndex, __construct)
             {
                 ZVAL_NULL(hsi->filter);
             }
-
-            filters_cstr = (char *)request_filter.c_str();
         }
     }
 
-    hs->cli->request_buf_open_index(
-        id, db, table, index, request_field.c_str(), filters_cstr);
+    hs_request_string(&request, HS_PROTOCOL_OPEN, 1);
+    HS_REQUEST_DELIM(&request);
 
-    if (hs->cli->get_error_code() < 0 ||
-        hs->cli->request_send() != 0)
+    /* id */
+    HS_REQUEST_LONG(&request, id);
+    HS_REQUEST_DELIM(&request);
+
+    /* db */
+    hs_request_string(&request, db, db_len);
+    HS_REQUEST_DELIM(&request);
+
+    /* table */
+    hs_request_string(&request, table, table_len);
+    HS_REQUEST_DELIM(&request);
+
+    /* index */
+    hs_request_string(&request, index, index_len);
+    HS_REQUEST_DELIM(&request);
+
+    /* fields */
+    hs_request_string(&request, request_field.c, request_field.len);
+
+    /* filters */
+    if (hsi->filter && Z_TYPE_P(hsi->filter) == IS_ARRAY)
+    {
+        hs_request_filter(&request, HASH_OF(hsi->filter) TSRMLS_CC);
+    }
+
+    /* eol */
+    HS_REQUEST_NEXT(&request);
+
+    /* request: send */
+    if (hs_request_send(hs, &request TSRMLS_CC) < 0)
+    {
+        smart_str_free(&request);
+        RETURN_FALSE;
+    }
+
+    smart_str_free(&request);
+
+    /* response */
+    hs_response_value(hs, hsi->error, return_value, 0 TSRMLS_CC);
+
+    if (Z_TYPE_P(return_value) == IS_BOOL && Z_LVAL_P(return_value) == 0)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
             "[handlersocket] unable to open index: %ld: %s",
-            id, hs->cli->get_error().c_str());
+            id, hsi->error == NULL ? "Unknwon error" : Z_STRVAL_P(hsi->error));
         RETURN_FALSE;
     }
-
-    if (hs->cli->response_recv(num_flds) != 0 ||
-        hs->cli->get_error_code() != 0)
-    {
-        hs->cli->response_buf_remove();
-
-        zend_throw_exception_ex(
-            hs_exception_ce, 0 TSRMLS_CC,
-            "[handlersocket] unable to open index: %ld: %s",
-            id, hs->cli->get_error().c_str());
-        RETURN_FALSE;
-    }
-
-    hs->cli->response_buf_remove();
 
     /* property */
     zend_update_property_stringl(
@@ -2411,9 +3339,10 @@ static ZEND_METHOD(HandlerSocketIndex, find)
     long limit = 1, offset = 0;
     zval *options = NULL;
 
+    smart_str request = {0};
+
     zval *filters = NULL, *in_values = NULL;
     long in_key = -1;
-
     int safe = -1;
 
     php_hs_index_t *hsi;
@@ -2433,7 +3362,7 @@ static ZEND_METHOD(HandlerSocketIndex, find)
     hs = (php_hs_t *)zend_object_store_get_object(hsi->link TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -2455,46 +3384,29 @@ static ZEND_METHOD(HandlerSocketIndex, find)
         /* options: safe */
         safe = hs_is_options_safe(HASH_OF(options) TSRMLS_CC);
 
-        /* options: filters, in_key, in_values */
+        /* options: fiters, in */
         hs_array_to_in_filter(
             HASH_OF(options), hsi->filter,
             &filters, &in_key, &in_values TSRMLS_CC);
     }
 
     /* find */
-    hs_request_find_execute(
-        hs, hsi->id, operate, criteria,
-        NULL, NULL, -1, limit, offset, filters, in_key, in_values TSRMLS_CC);
+    hs_request_find(
+        &request, hsi->id, operate, criteria,
+        limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+    /* eol */
+    HS_REQUEST_NEXT(&request);
 
     /* request: send */
-    if (hs->cli->request_send() != 0)
+    if (hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
-        ZVAL_STRINGL(
-            hsi->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
         ZVAL_BOOL(return_value, 0);
     }
     else
     {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hsi->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, 0 TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+        /* response */
+        hs_response_value(hs, hsi->error, return_value, 0 TSRMLS_CC);
     }
 
     zval_ptr_dtor(&operate);
@@ -2502,6 +3414,7 @@ static ZEND_METHOD(HandlerSocketIndex, find)
     {
         zval_ptr_dtor(&filters);
     }
+    smart_str_free(&request);
 
     /* exception */
     if (safe > 0 &&
@@ -2517,8 +3430,10 @@ static ZEND_METHOD(HandlerSocketIndex, find)
 static ZEND_METHOD(HandlerSocketIndex, insert)
 {
     zval ***args;
-    long i, argc = ZEND_NUM_ARGS();
     zval *operate, *fields;
+    long i, argc = ZEND_NUM_ARGS();
+
+    smart_str request = {0};
 
     php_hs_index_t *hsi;
     php_hs_t *hs;
@@ -2533,7 +3448,7 @@ static ZEND_METHOD(HandlerSocketIndex, insert)
         RETURN_FALSE;
     }
 
-    args = (zval ***)safe_emalloc(argc, sizeof(zval **), 0);
+    args = safe_emalloc(argc, sizeof(zval **), 0);
     if (zend_get_parameters_array_ex(argc, args) == FAILURE)
     {
         efree(args);
@@ -2544,7 +3459,7 @@ static ZEND_METHOD(HandlerSocketIndex, insert)
     hs = (php_hs_t *)zend_object_store_get_object(hsi->link TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         efree(args);
         zend_throw_exception_ex(
@@ -2588,44 +3503,28 @@ static ZEND_METHOD(HandlerSocketIndex, insert)
     }
 
     /* find */
-    hs_request_find_execute(
-        hs, hsi->id, operate, fields,
-        NULL, NULL, -1, 0, 0, NULL, -1, NULL TSRMLS_CC);
+    hs_request_find(
+        &request, hsi->id, operate, fields, 0, 0, NULL, -1, NULL TSRMLS_CC);
+
+
+    /* eol */
+    HS_REQUEST_NEXT(&request);
 
     /* request: send */
-    if (hs->cli->request_send() != 0)
+    if (hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
         ZVAL_BOOL(return_value, 0);
-        ZVAL_STRINGL(
-            hsi->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
     }
     else
     {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hsi->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, 1 TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+        /* response */
+        hs_response_value(hs, hsi->error, return_value, 1 TSRMLS_CC);
     }
 
-    zval_ptr_dtor(&operate);
-    zval_ptr_dtor(&fields);
-    efree(args);
+   zval_ptr_dtor(&operate);
+   zval_ptr_dtor(&fields);
+   smart_str_free(&request);
+   efree(args);
 }
 
 static ZEND_METHOD(HandlerSocketIndex, update)
@@ -2634,11 +3533,11 @@ static ZEND_METHOD(HandlerSocketIndex, update)
     zval *options = NULL;
     long limit = 1, offset = 0;
 
+    smart_str request = {0};
+
     zval *filters = NULL, *in_values = NULL;
     long in_key = -1;
-
-    int safe = -1;
-    int modify = 1;
+    int safe = -1, modify = 1;
 
     php_hs_index_t *hsi;
     php_hs_t *hs;
@@ -2657,7 +3556,7 @@ static ZEND_METHOD(HandlerSocketIndex, update)
     hs = (php_hs_t *)zend_object_store_get_object(hsi->link TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -2690,47 +3589,43 @@ static ZEND_METHOD(HandlerSocketIndex, update)
         /* options: safe */
         safe = hs_is_options_safe(HASH_OF(options) TSRMLS_CC);
 
-        /* options: filters, in_key, in_values */
+        /* options: fiters, in */
         hs_array_to_in_filter(
             HASH_OF(options), hsi->filter,
             &filters, &in_key, &in_values TSRMLS_CC);
     }
 
     /* find */
-    modify = hs_request_find_execute(
-        hs, hsi->id, operate, criteria,
-        modify_operate, modify_criteria,
-        -1, limit, offset, filters, in_key, in_values TSRMLS_CC);
+    hs_request_find(
+        &request, hsi->id, operate, criteria,
+        limit, offset, filters, in_key, in_values TSRMLS_CC);
 
-    /* request: send */
-    if (hs->cli->request_send() != 0)
+    /* find: modify */
+    modify = hs_request_find_modify(
+        &request, modify_operate, modify_criteria, -1 TSRMLS_CC);
+    if (modify >= 0)
+    {
+        /* eol */
+        HS_REQUEST_NEXT(&request);
+
+        /* request: send */
+        if (hs_request_send(hs, &request TSRMLS_CC) < 0)
+        {
+            ZVAL_BOOL(return_value, 0);
+        }
+        else
+        {
+            /* response */
+            hs_response_value(hs, hsi->error, return_value, modify TSRMLS_CC);
+        }
+    }
+    else
     {
         ZVAL_BOOL(return_value, 0);
         ZVAL_STRINGL(
             hsi->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-    }
-    else
-    {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hsi->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, modify TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+            "[handlersocket] unable to update parameter",
+            strlen("[handlersocket] unable to update parameter"), 1);
     }
 
     zval_ptr_dtor(&operate);
@@ -2739,6 +3634,7 @@ static ZEND_METHOD(HandlerSocketIndex, update)
     {
         zval_ptr_dtor(&filters);
     }
+    smart_str_free(&request);
 
     /* exception */
     if (safe > 0 &&
@@ -2756,9 +3652,10 @@ static ZEND_METHOD(HandlerSocketIndex, remove)
     zval *query, *operate, *criteria, *options = NULL;
     long limit = 1, offset = 0;
 
-    zval *remove, *filters = NULL, *in_values = NULL;
-    long in_key = -1;
+    smart_str request = {0};
 
+    zval *filters = NULL, *in_values = NULL;
+    long in_key = -1;
     int safe = -1;
 
     php_hs_index_t *hsi;
@@ -2778,7 +3675,7 @@ static ZEND_METHOD(HandlerSocketIndex, remove)
     hs = (php_hs_t *)zend_object_store_get_object(hsi->link TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -2800,58 +3697,41 @@ static ZEND_METHOD(HandlerSocketIndex, remove)
         /* options: safe */
         safe = hs_is_options_safe(HASH_OF(options) TSRMLS_CC);
 
-        /* options: filters, in_key, in_values */
+        /* options: fiters, in */
         hs_array_to_in_filter(
             HASH_OF(options), hsi->filter,
             &filters, &in_key, &in_values TSRMLS_CC);
     }
 
-    MAKE_STD_ZVAL(remove);
-    ZVAL_STRINGL(remove, HS_MODIFY_REMOVE, 1, 1);
-
     /* find */
-    hs_request_find_execute(
-        hs, hsi->id, operate, criteria,
-        remove, NULL, -1, limit, offset,
-        filters, in_key, in_values TSRMLS_CC);
+    hs_request_find(
+        &request, hsi->id, operate, criteria,
+        limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+    /* find: modify: D */
+    HS_REQUEST_DELIM(&request);
+    hs_request_string(&request, HS_MODIFY_REMOVE, 1);
+
+    /* eol */
+    HS_REQUEST_NEXT(&request);
 
     /* request: send */
-    if (hs->cli->request_send() != 0)
+    if (hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
         ZVAL_BOOL(return_value, 0);
-        ZVAL_STRINGL(
-            hsi->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
     }
     else
     {
-        size_t num_flds;
-
-        /* response: recv */
-        if (hs->cli->response_recv(num_flds) != 0 ||
-            hs->cli->get_error_code() != 0)
-        {
-            ZVAL_BOOL(return_value, 0);
-            ZVAL_STRINGL(
-                hsi->error,
-                (char *)hs->cli->get_error().c_str(),
-                hs->cli->get_error().size(), 1);
-        }
-        else
-        {
-            hs_response_value(hs, return_value, num_flds, 1 TSRMLS_CC);
-        }
-
-        hs->cli->response_buf_remove();
+        /* response */
+        hs_response_value(hs, hsi->error, return_value, 1 TSRMLS_CC);
     }
 
     zval_ptr_dtor(&operate);
-    zval_ptr_dtor(&remove);
     if (filters)
     {
         zval_ptr_dtor(&filters);
     }
+    smart_str_free(&request);
 
     /* exception */
     if (safe > 0 &&
@@ -2871,6 +3751,8 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
     HashPosition pos;
     zval **val;
 
+    smart_str request = {0};
+
     php_hs_index_t *hsi;
     php_hs_t *hs;
 
@@ -2889,7 +3771,7 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
     hs = (php_hs_t *)zend_object_store_get_object(hsi->link TSRMLS_CC);
     HS_CHECK_OBJECT(hs, HandlerSocket);
 
-    if (!hs->cli)
+    if (!hs->stream)
     {
         zend_throw_exception_ex(
             hs_exception_ce, 0 TSRMLS_CC,
@@ -2924,7 +3806,7 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
 
         convert_to_string(*method);
 
-        if (strcmp(Z_STRVAL_PP(method), "find") == 0)
+        if (strncmp(Z_STRVAL_PP(method), "find", strlen("find")) == 0)
         {
             /* method: find */
             zval **query, **tmp, *operate, *criteria;
@@ -2990,17 +3872,19 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
 
             if (options != NULL && Z_TYPE_P(options) == IS_ARRAY)
             {
-                /* options: filters, in_key, in_values */
+                /* options: fiters, in */
                 hs_array_to_in_filter(
                     HASH_OF(options), hsi->filter,
                     &filters, &in_key, &in_values TSRMLS_CC);
             }
 
             /* find */
-            hs_request_find_execute(
-                hs, hsi->id, operate, criteria,
-                NULL, NULL, -1, limit, offset,
-                filters, in_key, in_values TSRMLS_CC);
+            hs_request_find(
+                &request, hsi->id, operate, criteria,
+                limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+            /* eol */
+            HS_REQUEST_NEXT(&request);
 
             add_next_index_long(rmodify, 0);
             err = 0;
@@ -3011,7 +3895,7 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
                 zval_ptr_dtor(&filters);
             }
         }
-        else if (strcmp(Z_STRVAL_PP(method), "insert") == 0)
+        else if (strncmp(Z_STRVAL_PP(method), "insert", strlen("insert")) == 0)
         {
             /* method: insert */
             zval *operate, *fields;
@@ -3086,9 +3970,12 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
             ZVAL_STRINGL(operate, HS_PROTOCOL_INSERT, 1, 1);
 
             /* find */
-            hs_request_find_execute(
-                hs, hsi->id, operate, fields,
-                NULL, NULL, -1, 0, 0, NULL, -1, NULL TSRMLS_CC);
+            hs_request_find(
+                &request, hsi->id, operate, fields, 0, 0,
+                NULL, -1, NULL TSRMLS_CC);
+
+            /* eol */
+            HS_REQUEST_NEXT(&request);
 
             add_next_index_long(rmodify, 1);
             err = 0;
@@ -3096,10 +3983,10 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
             zval_ptr_dtor(&operate);
             zval_ptr_dtor(&fields);
         }
-        else if (strcmp(Z_STRVAL_PP(method), "remove") == 0)
+        else if (strncmp(Z_STRVAL_PP(method), "remove", strlen("remove")) == 0)
         {
             /* method: remove */
-            zval **query, **tmp, *operate, *criteria, *remove;
+            zval **query, **tmp, *operate, *criteria;
             zval *options = NULL, *filters = NULL, *in_values = NULL;
             long limit = 1, offset = 0, in_key = -1;
 
@@ -3159,32 +4046,35 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
 
             if (options != NULL && Z_TYPE_P(options) == IS_ARRAY)
             {
-                /* options: filters, in_key, in_values */
+                /* options: fiters, in */
                 hs_array_to_in_filter(
                     HASH_OF(options), hsi->filter,
                     &filters, &in_key, &in_values TSRMLS_CC);
             }
 
-            MAKE_STD_ZVAL(remove);
-            ZVAL_STRINGL(remove, HS_MODIFY_REMOVE, 1, 1);
-
             /* find */
-            hs_request_find_execute(
-                hs, hsi->id, operate, criteria,
-                remove, NULL, -1, limit, offset,
-                filters, in_key, in_values TSRMLS_CC);
+            hs_request_find(
+                &request, hsi->id, operate, criteria,
+                limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+            /* find: modify: D */
+            HS_REQUEST_DELIM(&request);
+
+            hs_request_string(&request, HS_MODIFY_REMOVE, 1);
+
+            /* eol */
+            HS_REQUEST_NEXT(&request);
 
             add_next_index_long(rmodify, 1);
             err = 0;
 
-            zval_ptr_dtor(&remove);
             zval_ptr_dtor(&operate);
             if (filters)
             {
                 zval_ptr_dtor(&filters);
             }
         }
-        else if (strcmp(Z_STRVAL_PP(method), "update") == 0)
+        else if (strncmp(Z_STRVAL_PP(method), "update", strlen("update")) == 0)
         {
             /* method: update */
             zval **query, **update, **tmp;
@@ -3264,17 +4154,29 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
 
             if (options != NULL && Z_TYPE_P(options) == IS_ARRAY)
             {
-                /* options: filters, in_key, in_values */
+                /* options: fiters, in */
                 hs_array_to_in_filter(
                     HASH_OF(options), hsi->filter,
                     &filters, &in_key, &in_values TSRMLS_CC);
             }
 
             /* find */
-            modify = hs_request_find_execute(
-                hs, hsi->id, operate, criteria,
-                modify_operate, modify_criteria, -1, limit, offset,
-                filters, in_key, in_values TSRMLS_CC);
+            hs_request_find(
+                &request, hsi->id, operate, criteria,
+                limit, offset, filters, in_key, in_values TSRMLS_CC);
+
+            //find: modify
+            modify = hs_request_find_modify(
+                &request, modify_operate, modify_criteria,
+                -1 TSRMLS_CC);
+            if (modify < 0)
+            {
+                err = -1;
+                break;
+            }
+
+            /* eol */
+            HS_REQUEST_NEXT(&request);
 
             add_next_index_long(rmodify, modify);
             err = 0;
@@ -3296,62 +4198,16 @@ static ZEND_METHOD(HandlerSocketIndex, multi)
     }
 
     /* request: send */
-    if (err < 0)
+    if (err < 0  || hs_request_send(hs, &request TSRMLS_CC) < 0)
     {
+        smart_str_free(&request);
         zval_ptr_dtor(&rmodify);
         RETURN_FALSE;
     }
+    smart_str_free(&request);
 
-    if (hs->cli->request_send() != 0)
-    {
-        ZVAL_BOOL(return_value, 0);
-        ZVAL_STRINGL(
-            hsi->error,
-            (char *)hs->cli->get_error().c_str(),
-            hs->cli->get_error().size(), 1);
-    }
-    else
-    {
-        n = zend_hash_num_elements(HASH_OF(rmodify));
-
-        array_init(return_value);
-        array_init(hsi->error);
-
-        for (i = 0; i < n; i++)
-        {
-            zval **tmp;
-            size_t num_flds, modify = 0;
-
-            if (zend_hash_index_find(
-                    HASH_OF(rmodify), i, (void **)&tmp) == SUCCESS)
-            {
-                modify = Z_LVAL_PP(tmp);
-            }
-
-            /* response: recv */
-            if (hs->cli->response_recv(num_flds) != 0 ||
-                hs->cli->get_error_code() != 0)
-            {
-                add_next_index_bool(return_value, 0);
-                add_next_index_stringl(
-                    hsi->error,
-                    (char *)hs->cli->get_error().c_str(),
-                    hs->cli->get_error().size(), 1);
-            }
-            else
-            {
-                zval *response;
-                MAKE_STD_ZVAL(response);
-
-                hs_response_value(hs, response, num_flds, modify TSRMLS_CC);
-
-                add_next_index_zval(return_value, response);
-                add_next_index_null(hsi->error);
-            }
-
-            hs->cli->response_buf_remove();
-        }
-    }
+    /* response */
+    hs_response_multi(hs, return_value, rmodify, hsi->error TSRMLS_CC);
 
     zval_ptr_dtor(&rmodify);
 }
